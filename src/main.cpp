@@ -303,10 +303,10 @@ struct EvRec {
     uint64_t h;  // hash of event_id
     int64_t ingest;
     int64_t ts;
-    uint64_t uh;  // hash of user_id
+    uint64_t ph;  // person hash, resolved at parse so no later phase reads the CSV bytes back
     const char* eid;
-    const char* uid;
-    uint32_t eidlen, uidlen;
+    const char* name;
+    uint32_t eidlen, namelen;
     int32_t price;
     uint8_t cat;
     uint8_t flags;  // 1 valid, 2 purchase
@@ -704,11 +704,11 @@ int main(int argc, char** argv) {
                         r.eidlen = fl[0];
                         if (!parse_ts(fp[3], fl[3], r.ingest)) r.ingest = INT64_MAX;
                         r.flags = 0;
-                        r.uid = fp[1];
-                        r.uidlen = fl[1];
+                        r.name = nullptr;
+                        r.namelen = 0;
                         r.price = 0;
                         r.cat = 0;
-                        r.uh = 0;
+                        r.ph = 0;
                         r.ts = 0;
                         bool ok = fl[1] && fl[5] && parse_ts(fp[2], fl[2], r.ts) && r.ts >= ws && r.ts < we;
                         if (ok) {
@@ -738,7 +738,7 @@ int main(int argc, char** argv) {
                         if (ok) {
                             int64_t pi = prodmap.find(hash_bytes(fp[5], fl[5]), fp[5], fl[5]);
                             r.cat = pi < 0 ? unknown_cat : prodcat[pi];
-                            r.uh = hash_bytes(fp[1], fl[1]);
+                            person_of(hash_bytes(fp[1], fl[1]), fp[1], fl[1], r.ph, r.name, r.namelen);
                             r.flags |= 1;
                         }
                         ev[r.h >> (64 - PBITS)].push_back(r);
@@ -809,7 +809,9 @@ int main(int argc, char** argv) {
                 for (EvRec* x : table) {
                     if (!x || !(x->flags & 1)) continue;
                     SessEv e;
-                    person_of(x->uh, x->uid, x->uidlen, e.ph, e.name, e.namelen);
+                    e.ph = x->ph;
+                    e.name = x->name;
+                    e.namelen = x->namelen;
                     e.ts = x->ts;
                     e.price = x->price;
                     e.cat = x->cat;
@@ -1024,5 +1026,14 @@ int main(int argc, char** argv) {
         write_parquet(outdir + "/campaign_daily/part-0.parquet", cols, n);
     }
     phase("write");
+#ifndef _WIN32
+    if (FILE* st = fopen("/proc/self/status", "r")) {
+        char line[256];
+        while (fgets(line, sizeof line, st))
+            if (!strncmp(line, "VmHWM", 5) || !strncmp(line, "RssFile", 7) || !strncmp(line, "RssAnon", 7))
+                fputs(line, stderr);
+        fclose(st);
+    }
+#endif
     return 0;
 }
