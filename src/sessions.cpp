@@ -63,6 +63,19 @@ struct EvTs {
     uint32_t ts, pc;
 };
 
+// Half-hour bin of one person's events (valid while its bit is set in `occ`). Two events of one bin are under
+// 30 min apart, so a bin never splits; consecutive occupied bins join iff next.mn - prev.mx <= GAP_MS.
+struct Bin {
+    uint32_t mn, mx, cnt;
+    int32_t head;  // purchases in this bin: list through Pur::next, -1 ends
+};
+struct Pur {
+    uint32_t pc;
+    int32_t next;
+};
+static_assert(GAP_MS < (1LL << 32), "bin width fits 32 bits");
+static const uint32_t BIN_MS = (uint32_t)GAP_MS;
+
 void sessions(const Ctx& c, EvParts& sp, CkParts& ckp, Agg& out) {
     const int T = c.T;
     const int NC = c.NC;
@@ -92,6 +105,11 @@ void sessions(const Ctx& c, EvParts& sp, CkParts& ckp, Agg& out) {
         vector<int64_t> catrev(NC, 0);
         vector<uint32_t> ccount(NCAMP, 0);
         vector<uint32_t> active;
+        const uint32_t nbins = (uint32_t)((c.we - c.ws - 1) / GAP_MS + 1);
+        vector<Bin> bins(nbins);
+        vector<uint64_t> occ((nbins + 63) / 64, 0);
+        vector<uint32_t> ob;
+        vector<Pur> pur;
         auto& rows = out.urows[t];
         int64_t* CS = out.c_sess[t].data();
         int64_t* CP = out.c_purch[t].data();
@@ -137,7 +155,30 @@ void sessions(const Ctx& c, EvParts& sp, CkParts& ckp, Agg& out) {
                     cb = ce;
                     continue;
                 }
-                sort_small(&evs[i], j - i, [](const EvTs& a, const EvTs& b) { return a.ts < b.ts; });
+                // bin the events; occupied bins in ts order replace a sort
+                uint32_t wlo = UINT32_MAX, whi = 0;
+                pur.clear();
+                for (size_t x = i; x < j; x++) {
+                    const uint32_t ts = evs[x].ts, bi = ts / BIN_MS, w = bi >> 6;
+                    const uint64_t bit = 1ull << (bi & 63);
+                    Bin& B = bins[bi];
+                    if (!(occ[w] & bit)) {
+                        occ[w] |= bit;
+                        B = {ts, ts, 1, -1};
+                        wlo = std::min(wlo, w), whi = std::max(whi, w);
+                    } else {
+                        B.mn = std::min(B.mn, ts), B.mx = std::max(B.mx, ts), B.cnt++;
+                    }
+                    if (evs[x].pc & PRICE_MASK) {
+                        pur.push_back({evs[x].pc, B.head});
+                        B.head = (int32_t)pur.size() - 1;
+                    }
+                }
+                ob.clear();
+                for (uint32_t w = wlo; w <= whi; w++) {
+                    for (uint64_t m = occ[w]; m; m &= m - 1) ob.push_back(w * 64 + (uint32_t)__builtin_ctzll(m));
+                    occ[w] = 0;
+                }
                 sort_small(&cks[cb], ce - cb, [](const ClickRec& a, const ClickRec& b) {
                     if (a.ts != b.ts) return a.ts < b.ts;
                     return bcmp3(a.cid, a.cidlen, b.cid, b.cidlen) < 0;
@@ -158,27 +199,32 @@ void sessions(const Ctx& c, EvParts& sp, CkParts& ckp, Agg& out) {
                     }
                     rows.push_back({key, (int32_t)cur_day, us, ue, ur, top});
                 };
-                size_t a = i;
-                while (a < j) {
-                    const int64_t start = evs[a].ts;          // ms since window_start
+                const size_t nob = ob.size();
+                size_t a = 0;
+                while (a < nob) {
+                    const int64_t start = bins[ob[a]].mn;     // ms since window_start
                     const int64_t start_c = start + WEEK_MS;  // the same instant on the click scale
                     size_t b = a + 1;
-                    while (b < j && evs[b].ts - evs[b - 1].ts <= GAP_MS) b++;
+                    while (b < nob && (int64_t)(bins[ob[b]].mn - bins[ob[b - 1]].mx) <= GAP_MS) b++;
                     int64_t day = (ws + start) / DAY_MS;
                     if (day != cur_day) {
                         flush();
                         cur_day = day, us = ue = ur = 0, anycat = false;
                     }
-                    int64_t rev = 0;
+                    int64_t rev = 0, nev = 0;
                     bool purchased = false;
-                    for (size_t x = a; x < b; x++)
-                        if (uint32_t price = evs[x].pc & PRICE_MASK) {
+                    for (size_t x = a; x < b; x++) {
+                        const Bin& B = bins[ob[x]];
+                        nev += B.cnt;
+                        for (int32_t h = B.head; h >= 0; h = pur[h].next) {
+                            const uint32_t price = pur[h].pc & PRICE_MASK;
                             purchased = true;
                             rev += price;
-                            catrev[evs[x].pc >> 24] += price;
+                            catrev[pur[h].pc >> 24] += price;
                             anycat = true;
                         }
-                    us++, ue += (int64_t)(b - a), ur += rev;
+                    }
+                    us++, ue += nev, ur += rev;
                     // clicks: window [start - 7d, start]
                     while (hi < ce && cks[hi].ts <= start_c) {
                         if (ccount[cks[hi].camp]++ == 0) active.push_back(cks[hi].camp);
