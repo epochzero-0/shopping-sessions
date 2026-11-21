@@ -57,6 +57,18 @@ struct Arena {
     }
 };
 
+// One thread's 64 KB blocks freed by an earlier stage, handed out before fresh (kernel-zeroed) arena pages.
+struct Recycler {
+    Arena* A;
+    vector<void*> free;
+    void* take(size_t bytes) {
+        if (free.empty()) return A->take(bytes);
+        void* p = free.back();
+        free.pop_back();
+        return p;
+    }
+};
+
 // Append-only list of T in 64 KB blocks from an Arena: no reallocation, no copying on growth.
 template <class T>
 struct BList {
@@ -64,7 +76,8 @@ struct BList {
     vector<T*> blocks;
     T* cur = nullptr;
     uint32_t last = B;  // count in the last block
-    void push(Arena& A, const T& x) {
+    template <class Alloc>  // Arena or Recycler
+    void push(Alloc& A, const T& x) {
         if (__builtin_expect(last == B, 0)) {
             cur = (T*)A.take(B * sizeof(T));
             blocks.push_back(cur);
@@ -257,6 +270,7 @@ static const uint32_t PRICE_MASK = 0xFFFFFF;
 // [thread][person partition], blocks in `arena`
 struct EvParts {
     Arena arena;
+    Arena evarena;  // the dedup stage's EvRec blocks; dead ones hold SessEv blocks, so it lives as long as p
     vector<vector<BList<SessEv>>> p;
 };
 struct CkParts {

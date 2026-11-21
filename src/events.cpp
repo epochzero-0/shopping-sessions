@@ -28,7 +28,7 @@ void parse_and_dedup(const Ctx& c, Links& L, EvParts& sp, CkParts& ckp) {
     // events by event_id hash, clicks by person hash
     // Arenas are virtual reservations sized for the shortest possible lines; only touched pages count.
     const size_t slack = (size_t)T * NPART * (1 << 16);
-    Arena eva;
+    Arena& eva = sp.evarena;
     eva.init(c.ev_bytes / 16 * sizeof(EvRec) + slack);
     ckp.arena.init(c.ck_bytes / 12 * sizeof(ClickRec) + slack);
     vector<vector<BList<EvRec>>> evp(T, vector<BList<EvRec>>(NPART));
@@ -144,6 +144,8 @@ void parse_and_dedup(const Ctx& c, Links& L, EvParts& sp, CkParts& ckp) {
     std::atomic<int> next{0};
     parallel(T, [&](int t) {
         auto& out = sp.p[t];
+        static_assert(BList<EvRec>::B * sizeof(EvRec) == BList<SessEv>::B * sizeof(SessEv), "block sizes");
+        Recycler rec{&sp.arena, {}};  // a finished partition's EvRec blocks become SessEv blocks
         // Filter: one slot per ~16 records, saturating at 2 (seen, dup bit pairs in one 16 B word).
         // Slot = the bits of kpart's product just below the partition bits. Equal event IDs share a slot, so a
         // record alone in its slot is unique; the rest go through the exact table (a false positive costs a probe).
@@ -214,9 +216,10 @@ void parse_and_dedup(const Ctx& c, Links& L, EvParts& sp, CkParts& ckp) {
                         if (x + D < n) __builtin_prefetch(L.at(p[x + D].uk));
                         if (p[x].ts == INVALID) continue;
                         const uint64_t pk = L.person(p[x].uk);
-                        out[kpart(pk)].push(sp.arena, {p[x].ts, p[x].pc, pk});
+                        out[kpart(pk)].push(rec, {p[x].ts, p[x].pc, pk});
                     }
                 });
+            for (int s = 0; s < T; s++) rec.free.insert(rec.free.end(), evp[s][q].blocks.begin(), evp[s][q].blocks.end());
         }
     });
     phase("dedup");
