@@ -144,21 +144,54 @@ void parse_and_dedup(const Ctx& c, Links& L, EvParts& sp, CkParts& ckp) {
     std::atomic<int> next{0};
     parallel(T, [&](int t) {
         auto& out = sp.p[t];
-        vector<EvRec*> table;
+        // Filter: one slot per ~16 records, saturating at 2 (seen, dup bit pairs in one 16 B word).
+        // Slot = the bits of kpart's product just below the partition bits. Equal event IDs share a slot, so a
+        // record alone in its slot is unique; the rest go through the exact table (a false positive costs a probe).
+        struct FW {
+            uint64_t seen, dup;
+        };
+        vector<FW> filt;
+        vector<EvRec*> table, spare;
         for (int k; (k = next++) < NPART;) {
             int q = order[k];
-            size_t cap = 16;
+            int fbits = 6;
+            while (((size_t)1 << fbits) < psize[q] * 16) fbits++;
+            filt.assign((size_t)1 << (fbits - 6), FW{0, 0});
+            auto slot = [&](uint64_t ek) { return (size_t)((ek * 0x9E3779B97F4A7C15ull) << PBITS >> (64 - fbits)); };
+            for (int s = 0; s < T; s++)
+                evp[s][q].each([&](const EvRec& r) {
+                    size_t i = slot(r.ek);
+                    FW& w = filt[i >> 6];
+                    const uint64_t m = 1ull << (i & 63);
+                    w.dup |= w.seen & m;
+                    w.seen |= m;
+                });
+            size_t cap = 16, used = 0;
             int bits = 4;
-            while (cap < psize[q] * 2) cap <<= 1, bits++;
+            while (cap < psize[q] / 2) cap <<= 1, bits++;  // ~1/8 of records reach it: load ~1/4
             table.assign(cap, nullptr);
-            const size_t mask = cap - 1;
             for (int s = 0; s < T; s++)
                 evp[s][q].each([&](EvRec& r) {
+                    size_t f = slot(r.ek);
+                    if (!(filt[f >> 6].dup >> (f & 63) & 1)) return;
+                    if (2 * (used + 1) > cap) {  // grow: entries hold distinct keys, so reinsertion keeps every winner
+                        spare.assign(cap * 2, nullptr);
+                        spare.swap(table);
+                        cap *= 2, bits++;
+                        for (EvRec* x : spare)
+                            if (x) {
+                                size_t j = (size_t)((x->ek * 0xD6E8FEB86659FD93ull) >> (64 - bits));
+                                while (table[j]) j = (j + 1) & (cap - 1);
+                                table[j] = x;
+                            }
+                    }
+                    const size_t mask = cap - 1;
                     size_t i = (size_t)((r.ek * 0xD6E8FEB86659FD93ull) >> (64 - bits));
                     while (true) {
                         EvRec* x = table[i];
                         if (!x) {
                             table[i] = &r;
+                            used++;
                             break;
                         }
                         if (x->ek == r.ek && x->eh2 == r.eh2) {  // the loser is marked dropped in place
