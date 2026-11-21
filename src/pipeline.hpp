@@ -1,6 +1,9 @@
 // Shared types and the interface between pipeline stages.
 #pragma once
+#include <atomic>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <thread>
 #include <vector>
@@ -49,53 +52,86 @@ struct Ctx {
 };
 
 // ---- links.cpp
-struct Links {
-    StrMap map;
-    vector<uint32_t> parent;  // after build: the root of every node
-    vector<const char*> nodep;
-    vector<uint32_t> nodel;
-    vector<uint64_t> personh;  // per node: hash of its person's name
-    // user -> (person hash, name)
-    void person_of(uint64_t uh, const char* p, uint32_t n, uint64_t& ph, const char*& name, uint32_t& nl) const {
-        int64_t id = map.find(uh, p, n);
-        if (id < 0) {
-            ph = uh, name = p, nl = n;
-        } else {
-            uint32_t r = parent[id];
-            ph = personh[id], name = nodep[r], nl = nodel[r];
+// user_id -> dense person id, concurrent. Link IDs are inserted first (ids 0..nodes-1) and point at their
+// union-find root; any other user is interned on first sight as a person of its own. names[pid] is the
+// person's name for every pid that is a root or an unlinked user.
+struct Persons {
+    struct Slot {
+        std::atomic<uint64_t> h;
+        std::atomic<uint32_t> h2;
+        std::atomic<uint32_t> id1;  // pid + 1, 0 while the inserting thread is still writing
+    };
+    Slot* s = nullptr;
+    size_t mask = 0;
+    const char** name_p = nullptr;
+    uint32_t* name_l = nullptr;
+    std::atomic<uint32_t> next{0};
+    uint32_t cap = 0;
+
+    void init(size_t n);
+    ~Persons();
+    // pid of a user, inserting it with a fresh pid if missing; `slot` receives the slot index
+    uint32_t get(const char* p, uint32_t n, size_t* slot = nullptr) {
+        uint64_t h = hash_bytes(p, n);
+        uint32_t h2v = hash2(p, n);
+        if (!h) h = 1;
+        size_t i = h & mask;
+        for (;;) {
+            uint64_t cur = s[i].h.load(std::memory_order_relaxed);
+            if (cur == 0) {
+                if (s[i].h.compare_exchange_strong(cur, h, std::memory_order_relaxed)) {
+                    uint32_t id = next.fetch_add(1, std::memory_order_relaxed);
+                    if (id >= cap) { fprintf(stderr, "person table full\n"); abort(); }
+                    name_p[id] = p;
+                    name_l[id] = n;
+                    s[i].h2.store(h2v, std::memory_order_relaxed);
+                    s[i].id1.store(id + 1, std::memory_order_release);
+                    if (slot) *slot = i;
+                    return id;
+                }
+            }
+            if (cur == h) {
+                uint32_t id1;
+                while (!(id1 = s[i].id1.load(std::memory_order_acquire))) {
+                }
+                if (s[i].h2.load(std::memory_order_relaxed) == h2v) {
+                    if (slot) *slot = i;
+                    return id1 - 1;
+                }
+            }
+            i = (i + 1) & mask;
         }
     }
 };
-void build_links(const Ctx& c, Links& L);
+static inline uint32_t ppart(uint32_t pid) { return (pid * 0x9E3779B1u) >> (32 - PBITS); }
+// est_users: an upper bound on distinct user IDs outside links
+void build_links(const Ctx& c, Persons& P, size_t est_users);
 
 // ---- events.cpp
 struct SessEv {
-    uint64_t ph;  // person hash
     int64_t ts;
-    const char* name;
-    uint32_t namelen;
+    uint32_t pid;
     int32_t price;
     uint8_t cat;
     uint8_t purchase;
 };
 
 struct ClickRec {
-    uint64_t ph;
     int64_t ts;
     const char* cid;
     uint32_t cidlen;
+    uint32_t pid;
     uint32_t camp;
 };
 
 // [thread][person partition]
 using EvParts = vector<vector<vector<SessEv>>>;
 using CkParts = vector<vector<vector<ClickRec>>>;
-void parse_and_dedup(const Ctx& c, const Links& L, EvParts& sp, CkParts& ckp);
+void parse_and_dedup(const Ctx& c, Persons& P, EvParts& sp, CkParts& ckp);
 
 // ---- sessions.cpp
 struct URow {
-    const char* name;
-    uint32_t namelen;
+    uint32_t pid;
     int32_t day;
     int64_t sessions, events, revenue;
     int32_t topcat;  // -1 null

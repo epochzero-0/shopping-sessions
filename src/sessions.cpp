@@ -46,22 +46,22 @@ void sessions(const Ctx& c, EvParts& sp, CkParts& ckp, Agg& out) {
                 vector<ClickRec>().swap(ckp[s][q]);
             }
             std::sort(evs.begin(), evs.end(), [](const SessEv& a, const SessEv& b) {
-                return a.ph != b.ph ? a.ph < b.ph : a.ts < b.ts;
+                return a.pid != b.pid ? a.pid < b.pid : a.ts < b.ts;
             });
             std::sort(cks.begin(), cks.end(), [](const ClickRec& a, const ClickRec& b) {
-                if (a.ph != b.ph) return a.ph < b.ph;
+                if (a.pid != b.pid) return a.pid < b.pid;
                 if (a.ts != b.ts) return a.ts < b.ts;
                 return bcmp3(a.cid, a.cidlen, b.cid, b.cidlen) < 0;
             });
             size_t ci = 0;
             size_t i = 0;
             while (i < evs.size()) {
-                uint64_t ph = evs[i].ph;
+                uint32_t pid = evs[i].pid;
                 size_t j = i;
-                while (j < evs.size() && evs[j].ph == ph) j++;
-                while (ci < cks.size() && cks[ci].ph < ph) ci++;
+                while (j < evs.size() && evs[j].pid == pid) j++;
+                while (ci < cks.size() && cks[ci].pid < pid) ci++;
                 size_t cb = ci;
-                while (ci < cks.size() && cks[ci].ph == ph) ci++;
+                while (ci < cks.size() && cks[ci].pid == pid) ci++;
                 size_t ce = ci;
                 size_t lo = cb, hi = cb;
                 // per-day user accumulators
@@ -76,7 +76,7 @@ void sessions(const Ctx& c, EvParts& sp, CkParts& ckp, Agg& out) {
                             if (catrev[x] > best && catrev[x] > 0) best = catrev[x], top = x;
                         std::fill(catrev.begin(), catrev.end(), 0);
                     }
-                    rows.push_back({evs[i].name, evs[i].namelen, (int32_t)cur_day, us, ue, ur, top});
+                    rows.push_back({pid, (int32_t)cur_day, us, ue, ur, top});
                 };
                 size_t a = i;
                 while (a < j) {

@@ -4,10 +4,25 @@
 #include "csv.hpp"
 #include "pipeline.hpp"
 
-void build_links(const Ctx& c, Links& L) {
+void Persons::init(size_t n) {
+    size_t c = 1024;
+    while (c < n * 2) c <<= 1;
+    s = (Slot*)calloc(c, sizeof(Slot));
+    mask = c - 1;
+    cap = (uint32_t)(c * 7 / 8);
+    name_p = (const char**)malloc(cap * sizeof(const char*));
+    name_l = (uint32_t*)malloc(cap * sizeof(uint32_t));
+}
+
+Persons::~Persons() {
+    free(s);
+    free(name_p);
+    free(name_l);
+}
+
+void build_links(const Ctx& c, Persons& P, size_t est_users) {
     const int T = c.T;
     struct LinkSide {
-        uint64_t h;
         const char* p;
         uint32_t n;
     };
@@ -21,18 +36,20 @@ void build_links(const Ctx& c, Links& L) {
                     const char* fp[2];
                     uint32_t fl[2];
                     if (!split<2>(b, e, fp, fl) || !fl[0] || !fl[1]) return;
-                    out.push_back({hash_bytes(fp[0], fl[0]), fp[0], fl[0]});
-                    out.push_back({hash_bytes(fp[1], fl[1]), fp[1], fl[1]});
+                    out.push_back({fp[0], fl[0]});
+                    out.push_back({fp[1], fl[1]});
                 });
             }
         });
     }
-    auto& parent = L.parent;
-    auto& nodep = L.nodep;
-    auto& nodel = L.nodel;
     size_t nsides = 0;
     for (auto& v : lparts) nsides += v.size();
-    L.map.init(nsides / 2 + 16);
+    P.init(nsides / 2 + est_users + 16);
+    // node id == pid: link IDs are inserted first, so their pids are 0..nodes-1
+    vector<uint32_t> parent;
+    vector<size_t> nslot;
+    parent.reserve(nsides / 2 + 16);
+    nslot.reserve(nsides / 2 + 16);
     auto find = [&](uint32_t x) {
         uint32_t r = x;
         while (parent[r] != r) r = parent[r];
@@ -43,13 +60,12 @@ void build_links(const Ctx& c, Links& L) {
         }
         return r;
     };
-    auto node = [&](const LinkSide& s) {
-        bool ins;
-        uint32_t id = L.map.insert(s.h, s.p, s.n, (uint32_t)parent.size(), ins);
-        if (ins) {
+    auto node = [&](const LinkSide& sd) {
+        size_t slot;
+        uint32_t id = P.get(sd.p, sd.n, &slot);
+        if (id == parent.size()) {
             parent.push_back(id);
-            nodep.push_back(s.p);
-            nodel.push_back(s.n);
+            nslot.push_back(slot);
         }
         return id;
     };
@@ -58,13 +74,8 @@ void build_links(const Ctx& c, Links& L) {
             uint32_t a = find(node(v[i])), b = find(node(v[i + 1]));
             if (a == b) continue;
             // keep the byte-wise smallest ID as root
-            if (bcmp3(nodep[b], nodel[b], nodep[a], nodel[a]) < 0) std::swap(a, b);
+            if (bcmp3(P.name_p[b], P.name_l[b], P.name_p[a], P.name_l[a]) < 0) std::swap(a, b);
             parent[b] = a;
         }
-    L.personh.resize(parent.size());
-    for (uint32_t i = 0; i < parent.size(); i++) {
-        uint32_t r = find(i);
-        L.personh[i] = (r == i) ? hash_bytes(nodep[i], nodel[i]) : 0;
-    }
-    for (uint32_t i = 0; i < parent.size(); i++) L.personh[i] = L.personh[parent[i]];
+    for (uint32_t i = 0; i < parent.size(); i++) P.s[nslot[i]].id1.store(find(i) + 1, std::memory_order_relaxed);
 }

@@ -30,6 +30,28 @@ static inline uint64_t hash_bytes(const char* p, size_t n) {
     return mix(mix(a ^ k0 ^ h, b ^ k1), n ^ k2);
 }
 
+// Independent second hash: with hash_bytes it identifies a string by 96 bits, no byte compare needed.
+static inline uint32_t hash2(const char* p, size_t n) {
+    const uint64_t k0 = 0x9fb21c651e98df25ull, k1 = 0xc2b2ae3d27d4eb4full, k2 = 0x165667b19e3779f9ull;
+    uint64_t h = 0x452821e638d01377ull ^ (n * k0);
+    while (n > 16) {
+        uint64_t a, b;
+        memcpy(&a, p, 8);
+        memcpy(&b, p + 8, 8);
+        h = mix(a ^ k1 ^ h, b ^ k2);
+        p += 16;
+        n -= 16;
+    }
+    uint64_t a = 0, b = 0;
+    if (n > 8) {
+        memcpy(&a, p, 8);
+        memcpy(&b, p + n - 8, 8);
+    } else if (n > 0) {
+        memcpy(&a, p, n);
+    }
+    return (uint32_t)(mix(mix(a ^ k1 ^ h, b ^ k2), n ^ k0) >> 17);
+}
+
 static inline bool same(const char* a, uint32_t al, const char* b, uint32_t bl) {
     return al == bl && memcmp(a, b, al) == 0;
 }
