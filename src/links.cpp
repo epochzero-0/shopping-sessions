@@ -1,4 +1,4 @@
-// Links: parse in parallel, union-find serially. A person's root is its byte-wise smallest ID.
+// Links: parse and intern in parallel, union-find on pids serially. A person's root is its byte-wise smallest ID.
 #include <atomic>
 
 #include "csv.hpp"
@@ -23,34 +23,58 @@ Persons::~Persons() {
 
 void build_links(const Ctx& c, Persons& P, size_t est_users) {
     const int T = c.T;
-    struct LinkSide {
-        const char* p;
-        uint32_t n;
-    };
-    vector<vector<LinkSide>> lparts(T);
+    const size_t NK = c.link_chunks.size();
+    // lines bound the link count; size the table before interning
+    vector<size_t> klines(NK);
+    {
+        std::atomic<size_t> next{0};
+        parallel(T, [&](int) {
+            for (size_t k; (k = next++) < NK;) {
+                const char* b = c.link_chunks[k].b;
+                const char* e = c.link_chunks[k].e;
+                size_t n = 0;
+                while (b < e) {
+                    const char* nl = (const char*)memchr(b, '\n', e - b);
+                    n++;
+                    if (!nl) break;
+                    b = nl + 1;
+                }
+                klines[k] = n;
+            }
+        });
+    }
+    size_t lines = 0;
+    for (size_t n : klines) lines += n;
+    P.init(lines + est_users + 16);
+    // Intern both sides in parallel. Only link IDs are inserted here, so their pids are 0..nodes-1.
+    // nslot[pid] = the pid's slot, written by the inserting thread.
+    const size_t maxnodes = 2 * lines + 16;
+    size_t* nslot = (size_t*)big_alloc(maxnodes * sizeof(size_t));
+    vector<vector<uint32_t>> edges(T);  // pid pairs
     {
         std::atomic<size_t> next{0};
         parallel(T, [&](int t) {
-            auto& out = lparts[t];
-            for (size_t k; (k = next++) < c.link_chunks.size();) {
+            auto& out = edges[t];
+            out.reserve(lines * 2 / T + 1024);
+            for (size_t k; (k = next++) < NK;) {
                 for_lines(c.link_chunks[k].b, c.link_chunks[k].e, [&](const char* b, const char* e) {
                     const char* fp[2];
                     uint32_t fl[2];
                     if (!split<2>(b, e, fp, fl) || !fl[0] || !fl[1]) return;
-                    out.push_back({fp[0], fl[0]});
-                    out.push_back({fp[1], fl[1]});
+                    for (int j = 0; j < 2; j++) {
+                        size_t slot;
+                        uint32_t id = P.get(fp[j], fl[j], &slot);
+                        // every thread finding this pid writes the same slot
+                        __atomic_store_n(&nslot[id], slot, __ATOMIC_RELAXED);
+                        out.push_back(id);
+                    }
                 });
             }
         });
     }
-    size_t nsides = 0;
-    for (auto& v : lparts) nsides += v.size();
-    P.init(nsides / 2 + est_users + 16);
-    // node id == pid: link IDs are inserted first, so their pids are 0..nodes-1
-    vector<uint32_t> parent;
-    vector<size_t> nslot;
-    parent.reserve(nsides / 2 + 16);
-    nslot.reserve(nsides / 2 + 16);
+    const uint32_t nodes = P.next.load();
+    vector<uint32_t> parent(nodes);
+    for (uint32_t i = 0; i < nodes; i++) parent[i] = i;
     auto find = [&](uint32_t x) {
         uint32_t r = x;
         while (parent[r] != r) r = parent[r];
@@ -61,22 +85,18 @@ void build_links(const Ctx& c, Persons& P, size_t est_users) {
         }
         return r;
     };
-    auto node = [&](const LinkSide& sd) {
-        size_t slot;
-        uint32_t id = P.get(sd.p, sd.n, &slot);
-        if (id == parent.size()) {
-            parent.push_back(id);
-            nslot.push_back(slot);
-        }
-        return id;
-    };
-    for (auto& v : lparts)
+    for (auto& v : edges)
         for (size_t i = 0; i < v.size(); i += 2) {
-            uint32_t a = find(node(v[i])), b = find(node(v[i + 1]));
+            uint32_t a = find(v[i]), b = find(v[i + 1]);
             if (a == b) continue;
             // keep the byte-wise smallest ID as root
             if (bcmp3(P.name_p[b], P.name_l[b], P.name_p[a], P.name_l[a]) < 0) std::swap(a, b);
             parent[b] = a;
         }
-    for (uint32_t i = 0; i < parent.size(); i++) P.s[nslot[i]].id1.store(find(i) + 1, std::memory_order_relaxed);
+    for (uint32_t i = 0; i < nodes; i++) parent[i] = find(i);
+    parallel(T, [&](int t) {
+        for (uint32_t i = (uint32_t)((uint64_t)nodes * t / T), e = (uint32_t)((uint64_t)nodes * (t + 1) / T); i < e; i++)
+            P.s[nslot[i]].id1.store(parent[i] + 1, std::memory_order_relaxed);
+    });
+    big_free(nslot, maxnodes * sizeof(size_t));
 }
