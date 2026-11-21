@@ -227,7 +227,7 @@ static void load_small(const string& data, Ctx& c) {
 
 // ------------------------------------------------------------------ output
 
-static void write_outputs(const Ctx& c, const Persons& P, Agg& A, const string& outdir) {
+static void write_outputs(const Ctx& c, const Links& L, Agg& A, const string& outdir) {
     const int T = c.T;
     fs::create_directories(outdir + "/user_daily");
     fs::create_directories(outdir + "/campaign_daily");
@@ -238,16 +238,17 @@ static void write_outputs(const Ctx& c, const Persons& P, Agg& A, const string& 
                             col_i64("sessions"), col_i64("events"), col_i64("revenue_cents"),
                             Col{"top_category", P_BYTES, true, 0, 1, {}}};
         size_t n = rows.size();
-        size_t namebytes = 0;
-        for (auto& r : rows) namebytes += P.name_l[r.pid] + 4;
-        cols[0].data.reserve(namebytes);
+        cols[0].data.reserve(n * 14);
         cols[1].data.reserve(n * 4);
         for (int k = 2; k < 5; k++) cols[k].data.reserve(n * 8);
         string defs((n + 7) / 8, '\0');
         string vals;
         for (size_t k = 0; k < n; k++) {
             auto& r = rows[k];
-            bytes_val(cols[0].data, P.name_p[r.pid], P.name_l[r.pid]);
+            char buf[16];
+            uint32_t nl;
+            const char* name = L.name(r.key, buf, nl);
+            bytes_val(cols[0].data, name, nl);
             put32(cols[1].data, (uint32_t)r.day);
             put64(cols[2].data, r.sessions);
             put64(cols[3].data, r.events);
@@ -341,16 +342,16 @@ static void run_once(const string& data, const string& outdir, int T) {
     Ctx c;
     c.T = T;
     load_small(data, c);
-    Persons P;
-    build_links(c, P, (c.ev_bytes / 50 + c.ck_bytes / 35) / 8);
+    Links L;
+    build_links(c, L, (c.ev_bytes / 50 + c.ck_bytes / 35) / 8);
     phase("links");
     EvParts sp;
     CkParts ckp;
-    parse_and_dedup(c, P, sp, ckp);
+    parse_and_dedup(c, L, sp, ckp);
     Agg A;
-    sessions(c, P.next.load(), sp, ckp, A);
+    sessions(c, sp, ckp, A);
     phase("sessions");
-    write_outputs(c, P, A, outdir);
+    write_outputs(c, L, A, outdir);
     phase("write");
     if (ckp.arena.spilled || sp.arena.spilled) fprintf(stderr, "arena spilled\n");
     record_run();

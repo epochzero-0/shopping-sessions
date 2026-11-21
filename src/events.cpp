@@ -6,20 +6,20 @@
 #include "pipeline.hpp"
 
 namespace {
-// 32 B. event_id is identified by 96 bits of hash, so dedup never reads the CSV bytes back.
+// 32 B. event_id: exact pack_id key, or for other IDs 95 bits of hash; dedup never reads the CSV bytes back.
 struct EvRec {
-    uint64_t h;      // hash_bytes(event_id)
-    uint32_t h2;     // hash2(event_id)
-    uint32_t ingest; // seconds since epoch
-    uint32_t ts;     // ms since window_start
-    uint32_t pid;    // person, resolved at parse
-    uint32_t pc;     // price | cat << 24
-    uint32_t flags;  // 1 valid
+    uint64_t ek;      // pack_id(event_id), or FBIT | hash_bytes(event_id) >> 1
+    uint32_t eh2;     // 0, or hash2(event_id) with a hashed ek
+    uint32_t ingest;  // seconds since epoch
+    uint32_t ts;      // ms since window_start; INVALID = dropped by validation
+    uint32_t pc;      // price | cat << 24
+    uint64_t uk;      // user key (FTab::key); the person is resolved after dedup
 };
 static_assert(sizeof(EvRec) == 32, "EvRec");
+static const uint32_t INVALID = UINT32_MAX;  // the window is < 2^32 ms - 7 days
 }  // namespace
 
-void parse_and_dedup(const Ctx& c, Persons& P, EvParts& sp, CkParts& ckp) {
+void parse_and_dedup(const Ctx& c, Links& L, EvParts& sp, CkParts& ckp) {
     const int T = c.T;
     const int64_t ws = c.ws, we = c.we;
     // events by event_id hash, clicks by person hash
@@ -41,15 +41,18 @@ void parse_and_dedup(const Ctx& c, Persons& P, EvParts& sp, CkParts& ckp) {
                     scan_lines<7>(ch.b, ch.e, [&](const char* const* fp, const uint32_t* fl) {
                         if (!fl[0]) return;
                         EvRec r;
-                        r.h = hash_bytes(fp[0], fl[0]);
-                        r.h2 = hash2(fp[0], fl[0]);
+                        r.ek = pack_id(fp[0], fl[0]);
+                        r.eh2 = 0;
+                        if (!r.ek) {
+                            r.ek = FBIT | hash_bytes(fp[0], fl[0]) >> 1;
+                            r.eh2 = hash2(fp[0], fl[0]);
+                        }
                         int64_t ingest, ts = 0, price = 0;
                         if (!parse_ts(fp[3], fl[3], ingest)) ingest = INT64_MAX;
                         r.ingest = ingest < 0 ? 0 : (uint32_t)std::min<int64_t>(ingest / 1000, UINT32_MAX);
-                        r.flags = 0;
                         r.pc = 0;
-                        r.pid = 0;
-                        r.ts = 0;
+                        r.uk = 0;
+                        r.ts = INVALID;
                         bool ok = fl[1] && fl[5] && parse_ts(fp[2], fl[2], ts) && ts >= ws && ts < we;
                         if (ok) {
                             const char* ty = fp[4];
@@ -79,10 +82,9 @@ void parse_and_dedup(const Ctx& c, Persons& P, EvParts& sp, CkParts& ckp) {
                             uint32_t cat = pi < 0 ? c.unknown_cat : c.prodcat[pi];
                             r.pc = (uint32_t)price | cat << 24;
                             r.ts = (uint32_t)(ts - ws);
-                            r.pid = P.get(fp[1], fl[1]);
-                            r.flags = 1;
+                            r.uk = L.F.key(fp[1], fl[1]);
                         }
-                        ev[r.h >> (64 - PBITS)].push(eva, r);
+                        ev[kpart(r.ek)].push(eva, r);
                     });
                 } else {
                     scan_lines<4>(ch.b, ch.e, [&](const char* const* fp, const uint32_t* fl) {
@@ -92,12 +94,13 @@ void parse_and_dedup(const Ctx& c, Persons& P, EvParts& sp, CkParts& ckp) {
                         int64_t ts;
                         if (!parse_ts(fp[3], fl[3], ts) || ts < ws - WEEK_MS || ts >= we) return;
                         ClickRec r;
-                        r.pid = P.get(fp[1], fl[1]);
+                        r.key = L.person(L.F.key(fp[1], fl[1]));
                         r.ts = (uint32_t)(ts - (ws - WEEK_MS));
                         r.cid = fp[0];
                         r.cidlen = fl[0];
+                        r.pad = 0;
                         r.camp = (uint32_t)camp;
-                        ck[ppart(r.pid)].push(ckp.arena, r);
+                        ck[kpart(r.key)].push(ckp.arena, r);
                     });
                 }
             }
@@ -105,7 +108,7 @@ void parse_and_dedup(const Ctx& c, Persons& P, EvParts& sp, CkParts& ckp) {
     }
     phase("parse events+clicks");
 
-    // dedup events per partition, emit survivors by person partition
+    // dedup events per partition; survivors resolve their person through the link table and go out by person partition
     sp.arena.init(c.ev_bytes / 16 * sizeof(SessEv) + slack);
     sp.p.assign(T, vector<BList<SessEv>>(NPART));
     vector<int> order(NPART);
@@ -122,29 +125,42 @@ void parse_and_dedup(const Ctx& c, Persons& P, EvParts& sp, CkParts& ckp) {
         for (int k; (k = next++) < NPART;) {
             int q = order[k];
             size_t cap = 16;
-            while (cap < psize[q] * 2) cap <<= 1;
+            int bits = 4;
+            while (cap < psize[q] * 2) cap <<= 1, bits++;
             table.assign(cap, nullptr);
-            size_t mask = cap - 1;
+            const size_t mask = cap - 1;
             for (int s = 0; s < T; s++)
                 evp[s][q].each([&](EvRec& r) {
-                    size_t i = (r.h * 0x9E3779B97F4A7C15ull >> 20) & mask;
+                    size_t i = (size_t)((r.ek * 0xD6E8FEB86659FD93ull) >> (64 - bits));
                     while (true) {
                         EvRec* x = table[i];
                         if (!x) {
                             table[i] = &r;
                             break;
                         }
-                        if (x->h == r.h && x->h2 == r.h2) {
-                            if (r.ingest < x->ingest) table[i] = &r;
+                        if (x->ek == r.ek && x->eh2 == r.eh2) {  // the loser is marked dropped in place
+                            if (r.ingest < x->ingest) {
+                                x->ts = INVALID;
+                                table[i] = &r;
+                            } else {
+                                r.ts = INVALID;
+                            }
                             break;
                         }
                         i = (i + 1) & mask;
                     }
                 });
-            for (EvRec* x : table) {
-                if (!x || !(x->flags & 1)) continue;
-                out[ppart(x->pid)].push(sp.arena, {x->ts, x->pid, x->pc});
-            }
+            // survivors in record order (sequential), link slot prefetched D records ahead
+            const uint32_t D = 16;
+            for (int s = 0; s < T; s++)
+                evp[s][q].each_block([&](const EvRec* p, uint32_t n) {
+                    for (uint32_t x = 0; x < n; x++) {
+                        if (x + D < n) __builtin_prefetch(L.at(p[x + D].uk));
+                        if (p[x].ts == INVALID) continue;
+                        const uint64_t pk = L.person(p[x].uk);
+                        out[kpart(pk)].push(sp.arena, {p[x].ts, p[x].pc, pk});
+                    }
+                });
         }
     });
     phase("dedup");

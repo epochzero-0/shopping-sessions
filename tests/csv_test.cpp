@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "../src/csv.hpp"
+#include "../src/hash.hpp"
 
 static std::string unhex(const std::string& s) {
     if (s == "." || s == "-") return {};
@@ -80,6 +81,37 @@ static std::string scan_blob(const Buf& b, bool use_scan) {
     return r;
 }
 
+// pack_id vs pack_id_ref on random strings over the class boundaries; packed keys unpack to the input.
+static long key_tests(long& total) {
+    static const char alpha[] = "0189az/:`{AZ@[\x80\xff u-_\"";
+    long bad = 0;
+    uint64_t s = 88172645463325252ull;
+    auto rnd = [&]() { s ^= s << 13, s ^= s >> 7, s ^= s << 17; return s; };
+    for (int it = 0; it < 400000; it++) {
+        uint32_t n = (uint32_t)(rnd() % 14);
+        std::string x(n, '\0');
+        bool lower = rnd() % 4 != 0;  // most strings stay in [0-9a-z]
+        for (auto& ch : x) ch = lower ? "0123456789abcdefghijklmnopqrstuvwxyz"[rnd() % 36] : alpha[rnd() % (sizeof alpha - 1)];
+        Buf b(x);
+        uint64_t k = pack_id(b.p, n), r = pack_id_ref(b.p, n);
+        total++;
+        bool ok = k == r;
+        if (ok && k) {
+            char out[16];
+            uint32_t m = unpack_id(k, out);
+            ok = m == n && memcmp(out, x.data(), n) == 0 && k < (1ull << 60);
+        }
+        if (ok && !k) {  // 0 only outside the form
+            bool form = n >= 1 && n <= 10;
+            for (char ch : x) form &= (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'z');
+            ok = !form;
+        }
+        if (!ok && ++bad <= 10) fprintf(stderr, "KEY MISMATCH %s: %llx vs %llx\n", hex(x.data(), n).c_str(),
+                                        (unsigned long long)k, (unsigned long long)r);
+    }
+    return bad;
+}
+
 int main(int argc, char** argv) {
     std::ifstream in(argc > 1 ? argv[1] : "build/csv_cases.txt");
     if (!in) { fprintf(stderr, "no cases file\n"); return 2; }
@@ -130,6 +162,8 @@ int main(int argc, char** argv) {
             if (++bad <= 10) fprintf(stderr, "MISMATCH %s\n  got  %s\n", line.c_str(), got.c_str());
         }
     }
-    printf("unit %ld/%ld scan %ld/%ld\n", total - bad, total, scan_total - scan_bad, scan_total);
-    return bad || scan_bad ? 1 : 0;
+    long key_total = 0, key_bad = key_tests(key_total);
+    printf("unit %ld/%ld scan %ld/%ld keys %ld/%ld\n", total - bad, total, scan_total - scan_bad, scan_total,
+           key_total - key_bad, key_total);
+    return bad || scan_bad || key_bad ? 1 : 0;
 }

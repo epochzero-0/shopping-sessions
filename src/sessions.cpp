@@ -19,7 +19,51 @@ static inline void sort_small(R* a, size_t n, Less less) {
     }
 }
 
-void sessions(const Ctx& c, uint32_t npid, EvParts& sp, CkParts& ckp, Agg& out) {
+// Person key -> dense local id within one partition; sized to stay in L2, doubles when half full.
+struct Intern {
+    vector<uint64_t> k;  // 0 = empty (no key is 0)
+    vector<uint32_t> v;
+    vector<uint64_t> keys;  // local id -> key
+    size_t mask = 0;
+    int shift = 64;
+    void reset(size_t cap) {
+        int b = 0;
+        while (((size_t)1 << b) < cap) b++;
+        k.assign((size_t)1 << b, 0);
+        v.resize((size_t)1 << b);
+        mask = ((size_t)1 << b) - 1;
+        shift = 64 - b;
+        keys.clear();
+    }
+    uint32_t get(uint64_t key) {
+        for (size_t i = (size_t)((key * 0xC2B2AE3D27D4EB4Full) >> shift);; i = (i + 1) & mask) {
+            const uint64_t x = k[i];
+            if (x == key) return v[i];
+            if (!x) {
+                if ((keys.size() + 1) * 2 > mask + 1) {
+                    grow();
+                    return get(key);
+                }
+                k[i] = key;
+                v[i] = (uint32_t)keys.size();
+                keys.push_back(key);
+                return v[i];
+            }
+        }
+    }
+    void grow() {
+        vector<uint64_t> old;
+        old.swap(keys);
+        reset((mask + 1) * 2);
+        for (uint64_t key : old) get(key);
+    }
+};
+
+struct EvTs {
+    uint32_t ts, pc;
+};
+
+void sessions(const Ctx& c, EvParts& sp, CkParts& ckp, Agg& out) {
     const int T = c.T;
     const int NC = c.NC;
     const uint32_t NCAMP = c.NCAMP;
@@ -38,29 +82,13 @@ void sessions(const Ctx& c, uint32_t npid, EvParts& sp, CkParts& ckp, Agg& out) 
         for (int t = 0; t < T; t++) psize[q] += sp.p[t][q].size();
     }
     std::sort(order.begin(), order.end(), [&](int a, int b) { return psize[a] > psize[b]; });
-    // lid[pid]: dense index of pid within its partition, so each partition groups persons by counting sort.
-    vector<uint32_t> lid(npid), nper(NPART, 0), pcur((size_t)T * NPART, 0);
-    parallel(T, [&](int t) {
-        uint32_t lo = (uint32_t)((uint64_t)npid * t / T), hi = (uint32_t)((uint64_t)npid * (t + 1) / T);
-        uint32_t* cnt = &pcur[(size_t)t * NPART];
-        for (uint32_t p = lo; p < hi; p++) cnt[ppart(p)]++;
-    });
-    for (int q = 0; q < NPART; q++)
-        for (int t = 0; t < T; t++) {
-            uint32_t n = pcur[(size_t)t * NPART + q];
-            pcur[(size_t)t * NPART + q] = nper[q];
-            nper[q] += n;
-        }
-    parallel(T, [&](int t) {
-        uint32_t lo = (uint32_t)((uint64_t)npid * t / T), hi = (uint32_t)((uint64_t)npid * (t + 1) / T);
-        uint32_t* nx = &pcur[(size_t)t * NPART];
-        for (uint32_t p = lo; p < hi; p++) lid[p] = nx[ppart(p)]++;
-    });
     std::atomic<int> next{0};
     parallel(T, [&](int t) {
-        vector<SessEv> evs;
+        Intern I;
+        I.reset(1 << 12);
+        vector<EvTs> evs;
         vector<ClickRec> cks;
-        vector<uint32_t> eoff, coff;
+        vector<uint32_t> eoff, coff, le, lc;
         vector<int64_t> catrev(NC, 0);
         vector<uint32_t> ccount(NCAMP, 0);
         vector<uint32_t> active;
@@ -71,30 +99,34 @@ void sessions(const Ctx& c, uint32_t npid, EvParts& sp, CkParts& ckp, Agg& out) 
         int64_t* CA = out.c_assist[t].data();
         for (int k; (k = next++) < NPART;) {
             int q = order[k];
-            const uint32_t nq = nper[q];
-            // counting sort by lid, straight from the blocks: count, prefix, scatter
-            eoff.assign(nq + 1, 0);
-            coff.assign(nq + 1, 0);
-            size_t ne = 0, nck = 0;
+            // local id per record (intern), then counting sort by it straight from the blocks
+            I.reset(I.mask + 1);
+            le.clear();
+            lc.clear();
             for (int s = 0; s < T; s++) {
                 sp.p[s][q].each_block([&](const SessEv* p, uint32_t n) {
-                    for (uint32_t x = 0; x < n; x++) eoff[lid[p[x].pid] + 1]++;
-                    ne += n;
+                    for (uint32_t x = 0; x < n; x++) le.push_back(I.get(p[x].key));
                 });
                 ckp.p[s][q].each_block([&](const ClickRec* p, uint32_t n) {
-                    for (uint32_t x = 0; x < n; x++) coff[lid[p[x].pid] + 1]++;
-                    nck += n;
+                    for (uint32_t x = 0; x < n; x++) lc.push_back(I.get(p[x].key));
                 });
             }
+            const uint32_t nq = (uint32_t)I.keys.size();
+            const size_t ne = le.size(), nck = lc.size();
+            eoff.assign(nq + 1, 0);
+            coff.assign(nq + 1, 0);
+            for (uint32_t l : le) eoff[l + 1]++;
+            for (uint32_t l : lc) coff[l + 1]++;
             for (uint32_t l = 0; l < nq; l++) eoff[l + 1] += eoff[l], coff[l + 1] += coff[l];
             evs.resize(ne);
             cks.resize(nck);
+            size_t xe = 0, xc = 0;
             for (int s = 0; s < T; s++) {
                 sp.p[s][q].each_block([&](const SessEv* p, uint32_t n) {
-                    for (uint32_t x = 0; x < n; x++) evs[eoff[lid[p[x].pid]]++] = p[x];
+                    for (uint32_t x = 0; x < n; x++) evs[eoff[le[xe++]]++] = {p[x].ts, p[x].pc};
                 });
                 ckp.p[s][q].each_block([&](const ClickRec* p, uint32_t n) {
-                    for (uint32_t x = 0; x < n; x++) cks[coff[lid[p[x].pid]]++] = p[x];
+                    for (uint32_t x = 0; x < n; x++) cks[coff[lc[xc++]]++] = p[x];
                 });
             }
             // after the scatter, eoff[l] / coff[l] is the end of person l
@@ -105,12 +137,12 @@ void sessions(const Ctx& c, uint32_t npid, EvParts& sp, CkParts& ckp, Agg& out) 
                     cb = ce;
                     continue;
                 }
-                sort_small(&evs[i], j - i, [](const SessEv& a, const SessEv& b) { return a.ts < b.ts; });
+                sort_small(&evs[i], j - i, [](const EvTs& a, const EvTs& b) { return a.ts < b.ts; });
                 sort_small(&cks[cb], ce - cb, [](const ClickRec& a, const ClickRec& b) {
                     if (a.ts != b.ts) return a.ts < b.ts;
                     return bcmp3(a.cid, a.cidlen, b.cid, b.cidlen) < 0;
                 });
-                const uint32_t pid = evs[i].pid;
+                const uint64_t key = I.keys[l];
                 size_t lo = cb, hi = cb;
                 // per-day user accumulators
                 int64_t cur_day = INT64_MIN, us = 0, ue = 0, ur = 0;
@@ -124,7 +156,7 @@ void sessions(const Ctx& c, uint32_t npid, EvParts& sp, CkParts& ckp, Agg& out) 
                             if (catrev[x] > best && catrev[x] > 0) best = catrev[x], top = x;
                         std::fill(catrev.begin(), catrev.end(), 0);
                     }
-                    rows.push_back({pid, (int32_t)cur_day, us, ue, ur, top});
+                    rows.push_back({key, (int32_t)cur_day, us, ue, ur, top});
                 };
                 size_t a = i;
                 while (a < j) {

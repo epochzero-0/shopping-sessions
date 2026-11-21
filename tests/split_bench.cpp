@@ -1,10 +1,10 @@
 // Parse ablation over the 20M events (N=7) and clicks (N=4).
 // Usage: split_bench DATA_DIR THREADS [MODE] [RUNG]   Prints the min of 5 runs per mode.
 //   MODE 0 for_lines only, 1 for_lines+split, 2 scan_lines, 3 ladder (all rungs, or only RUNG).
-// Ladder, cumulative, copies of the events.cpp loop: 0 scan, 1 + hashes (eid h/h2, product, user h/h2),
-// 2 + parse_ts and validation, 3 + product/campaign lookup, 4 + Persons::get, 5 + scatter into arenas (fresh
-// each rep, so first-touch faults count), 6 = 5 with the person table and arenas pre-faulted outside the timer,
-// 7 = 4 with only the person table pre-faulted.
+// Ladder, cumulative, copies of the events.cpp loop: 0 scan, 1 + keys (eid pack_id, product hash, user FTab::key),
+// 2 + parse_ts and validation, 3 + product/campaign lookup, 4 + click person probe (Links::person; links built once
+// outside the timer), 5 + scatter into arenas (fresh each rep, so first-touch faults count), 6 = 5 with the arenas
+// pre-faulted outside the timer.
 // g++ -O3 -march=cascadelake -std=c++17 -pthread tests/split_bench.cpp
 #include <dirent.h>
 #include <fcntl.h>
@@ -30,26 +30,14 @@ void* big_alloc(size_t bytes) {
     return p;
 }
 void big_free(void* p, size_t bytes) { munmap(p, bytes); }
-void Persons::init(size_t n) {  // copy of links.cpp
-    size_t c = 1024;
-    while (c < n * 2) c <<= 1;
-    s = (Slot*)big_alloc(c * sizeof(Slot));
-    mask = c - 1;
-    cap = (uint32_t)(c * 7 / 8);
-    name_p = (const char**)big_alloc(cap * sizeof(const char*));
-    name_l = (uint32_t*)big_alloc(cap * sizeof(uint32_t));
-}
-Persons::~Persons() {
-    if (!s) return;
-    big_free(s, (mask + 1) * sizeof(Slot));
-    big_free(name_p, cap * sizeof(const char*));
-    big_free(name_l, cap * sizeof(uint32_t));
-}
+#include "../src/links.cpp"
 
 struct EvRec {  // as events.cpp
-    uint64_t h;
-    uint32_t h2, ingest, ts, pid, pc, flags;
+    uint64_t ek;
+    uint32_t eh2, ingest, ts, pc;
+    uint64_t uk;
 };
+static const uint32_t INVALID = UINT32_MAX;
 
 static const char* map_all(const std::string& path, size_t& n) {
     int fd = open(path.c_str(), O_RDONLY);
@@ -131,30 +119,22 @@ struct Lists {
     std::vector<std::vector<BList<ClickRec>>> ck;
 };
 
-// One rung over all chunks on T threads; returns seconds. Persons/arenas set up (and torn down) outside the timer.
-static double ladder(const std::vector<Chunk>& ch, const Ctx& c, int T, int R, size_t ev_bytes, size_t ck_bytes,
-                     size_t est_persons, uint64_t& check, uint64_t& lines) {
-    Persons P;
-    P.init(est_persons);
+// One rung over all chunks on T threads; returns seconds. Arenas set up (and torn down) outside the timer.
+static double ladder(const std::vector<Chunk>& ch, const Ctx& c, Links& K, int T, int R, size_t ev_bytes,
+                     size_t ck_bytes, uint64_t& check, uint64_t& lines) {
     Lists L;
     const size_t slack = (size_t)T * NPART * (1 << 16);
     L.eva.init(ev_bytes / 16 * sizeof(EvRec) + slack);
     L.cka.init(ck_bytes / 12 * sizeof(ClickRec) + slack);
     L.ev.assign(T, std::vector<BList<EvRec>>(NPART));
     L.ck.assign(T, std::vector<BList<ClickRec>>(NPART));
-    if (R >= 6) {  // pre-fault the whole person table; rung 6 also ~what the arenas will touch
+    if (R == 6) {  // pre-fault ~what the arenas will touch
         auto p0 = std::chrono::steady_clock::now();
-        memset((void*)P.s, 0, (P.mask + 1) * sizeof(Persons::Slot));
-        memset(P.name_p, 0, P.cap * sizeof(const char*));
-        memset(P.name_l, 0, P.cap * sizeof(uint32_t));
-        if (R == 6) {
-            memset(L.eva.base, 0, std::min(L.eva.cap, ev_bytes / 40 * sizeof(EvRec) + slack));
-            memset(L.cka.base, 0, std::min(L.cka.cap, ck_bytes / 30 * sizeof(ClickRec) + slack));
-        }
-        fprintf(stderr, "prefault (1 thread) %.3f s, table %zu MB\n",
-                std::chrono::duration<double>(std::chrono::steady_clock::now() - p0).count(),
-                (P.mask + 1) * sizeof(Persons::Slot) >> 20);
-        R = R == 6 ? 5 : 4;
+        memset(L.eva.base, 0, std::min(L.eva.cap, ev_bytes / 40 * sizeof(EvRec) + slack));
+        memset(L.cka.base, 0, std::min(L.cka.cap, ck_bytes / 30 * sizeof(ClickRec) + slack));
+        fprintf(stderr, "prefault (1 thread) %.3f s\n",
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - p0).count());
+        R = 5;
     }
     const int64_t ws = c.ws, we = c.we;
     std::atomic<size_t> next{0};
@@ -172,15 +152,20 @@ static double ladder(const std::vector<Chunk>& ch, const Ctx& c, int T, int R, s
                     if (R == 0) { s += sum<7>(fp, fl); return; }
                     if (!fl[0]) return;
                     EvRec r;
-                    r.h = hash_bytes(fp[0], fl[0]);
-                    r.h2 = hash2(fp[0], fl[0]);
+                    r.ek = pack_id(fp[0], fl[0]);
+                    r.eh2 = 0;
+                    if (!r.ek) {
+                        r.ek = FBIT | hash_bytes(fp[0], fl[0]) >> 1;
+                        r.eh2 = hash2(fp[0], fl[0]);
+                    }
                     const uint64_t hp = hash_bytes(fp[5], fl[5]);
-                    if (R < 4) s += hash_bytes(fp[1], fl[1]) ^ hash2(fp[1], fl[1]);
-                    if (R == 1) { s += r.h ^ r.h2 ^ hp; return; }
+                    if (R == 1) { s += r.ek ^ r.eh2 ^ hp ^ (fl[1] ? K.F.key(fp[1], fl[1]) : 0); return; }
                     int64_t ingest, ts = 0, price = 0;
                     if (!parse_ts(fp[3], fl[3], ingest)) ingest = INT64_MAX;
                     r.ingest = ingest < 0 ? 0 : (uint32_t)std::min<int64_t>(ingest / 1000, UINT32_MAX);
-                    r.flags = r.pc = r.pid = r.ts = 0;
+                    r.pc = 0;
+                    r.uk = 0;
+                    r.ts = INVALID;
                     bool ok = fl[1] && fl[5] && parse_ts(fp[2], fl[2], ts) && ts >= ws && ts < we;
                     if (ok) {
                         const char* ty = fp[4];
@@ -206,18 +191,17 @@ static double ladder(const std::vector<Chunk>& ch, const Ctx& c, int T, int R, s
                     if (ok && ingest - ts > DAY_MS) ok = false;
                     if (ok) {
                         r.ts = (uint32_t)(ts - ws);
-                        r.flags = 1;
                         if (R >= 3) {
                             int64_t pi = c.prodmap.find(hp, fp[5], fl[5]);
                             r.pc = (uint32_t)price | (uint32_t)(pi < 0 ? 255 : c.prodcat[pi]) << 24;
                         } else {
                             r.pc = (uint32_t)price ^ (uint32_t)hp;
                         }
-                        if (R >= 4) r.pid = P.get(fp[1], fl[1]);
+                        r.uk = K.F.key(fp[1], fl[1]);
                     }
-                    if (R < 5) { s += r.h ^ r.h2 ^ r.ingest ^ r.ts ^ r.pc ^ r.pid ^ r.flags; return; }
-                    s += r.pid;
-                    ev[r.h >> (64 - PBITS)].push(L.eva, r);
+                    if (R < 5) { s += r.ek ^ r.eh2 ^ r.ingest ^ r.ts ^ r.pc ^ r.uk; return; }
+                    s += r.uk;
+                    ev[kpart(r.ek)].push(L.eva, r);
                 });
             } else {
                 scan_lines<4>(x.b, x.e, [&](const char* const* fp, const uint32_t* fl) {
@@ -225,21 +209,22 @@ static double ladder(const std::vector<Chunk>& ch, const Ctx& c, int T, int R, s
                     if (R == 0) { s += sum<4>(fp, fl); return; }
                     if (!fl[0] || !fl[1]) return;
                     const uint64_t hc = hash_bytes(fp[2], fl[2]);
-                    if (R < 4) s += hash_bytes(fp[1], fl[1]) ^ hash2(fp[1], fl[1]);
-                    if (R == 1) { s += hc; return; }
+                    const uint64_t uk = K.F.key(fp[1], fl[1]);
+                    if (R == 1) { s += hc ^ uk; return; }
                     int64_t ts;
                     if (!parse_ts(fp[3], fl[3], ts) || ts < ws - WEEK_MS || ts >= we) return;
                     int64_t camp = (int64_t)(hc & 7);
                     if (R >= 3 && (camp = c.campmap.find(hc, fp[2], fl[2])) < 0) return;
                     ClickRec r;
-                    r.pid = R >= 4 ? P.get(fp[1], fl[1]) : 0;
+                    r.key = R >= 4 ? K.person(uk) : uk;
                     r.ts = (uint32_t)(ts - (ws - WEEK_MS));
                     r.cid = fp[0];
                     r.cidlen = fl[0];
+                    r.pad = 0;
                     r.camp = (uint32_t)camp;
-                    if (R < 5) { s += r.pid ^ r.ts ^ r.camp ^ r.cidlen; return; }
-                    s += r.pid;
-                    ck[ppart(r.pid)].push(L.cka, r);
+                    if (R < 5) { s += r.key ^ r.ts ^ r.camp ^ r.cidlen; return; }
+                    s += r.key;
+                    ck[kpart(r.key)].push(L.cka, r);
                 });
             }
         }
@@ -249,7 +234,6 @@ static double ladder(const std::vector<Chunk>& ch, const Ctx& c, int T, int R, s
     double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     check = tot;
     lines = cnt;
-    if (R >= 4) check ^= (uint64_t)P.next.load() << 40;
     return sec;
 }
 
@@ -305,23 +289,19 @@ int main(int argc, char** argv) {
     }
     if (only >= 0 && only != 3) return 0;
     Ctx c;
+    c.T = T;
     load_small(d, c);
-    size_t link_lines = 0;
-    for (auto& path : csvs(d + "/links")) {
-        size_t n;
-        const char* p = map_all(path, n);
-        for (size_t i = 0; i < n; i++) link_lines += p[i] == '\n';
-    }
-    // as main.cpp + build_links: link lines + est_users
-    const size_t est = link_lines + (evb / 50 + ckb / 35) / 8 + 16;
-    const char* rn[] = {"scan", "+hashes", "+parse_ts", "+lookup", "+P.get", "+scatter", "L5 all prefault",
-                        "L4 table prefault"};
+    size_t lkb = 0;
+    add_dir(d + "/links", 2, c.link_chunks, lkb);
+    Links K;
+    build_links(c, K, (evb / 50 + ckb / 35) / 8);  // as main.cpp
+    const char* rn[] = {"scan", "+keys", "+parse_ts", "+lookup", "+click probe", "+scatter", "L5 arenas prefault"};
     double prev = 0;
-    for (int R = 0; R <= 7; R++) {
+    for (int R = 0; R <= 6; R++) {
         if (rung >= 0 && R != rung) continue;
         double best = 1e9;
         uint64_t check = 0, lines = 0;
-        for (int rep = 0; rep < 5; rep++) best = std::min(best, ladder(ch, c, T, R, evb, ckb, est, check, lines));
+        for (int rep = 0; rep < 5; rep++) best = std::min(best, ladder(ch, c, K, T, R, evb, ckb, check, lines));
         printf("L%d %-18s %.3f s  delta %+.3f  ns/line/thread %.0f  lines %lu  check %lx\n", R, rn[R], best,
                R && R < 6 ? best - prev : 0.0, best * T * 1e9 / lines, (unsigned long)lines, (unsigned long)check);
         if (R < 6) prev = best;

@@ -3,6 +3,60 @@
 #include <cstdint>
 #include <cstring>
 #include <vector>
+#ifdef __AVX512BW__
+#include <immintrin.h>
+#endif
+
+// Exact 64-bit key of an ID of 1..10 bytes from [0-9a-z]: byte i becomes a 6-bit code (digit 1..10, letter 11..36) at
+// bit 6i. Codes are nonzero, so the length is implicit: key != 0, key < 2^60, one key per ID. 0 = not in that form.
+static inline uint64_t pack_id_ref(const char* p, uint32_t n) {
+    if (n - 1 >= 10u) return 0;
+    uint64_t k = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        unsigned c = (unsigned char)p[i], d;
+        if (c - '0' < 10u)
+            d = c - '0' + 1;
+        else if (c - 'a' < 26u)
+            d = c - 'a' + 11;
+        else
+            return 0;
+        k |= (uint64_t)d << (6 * i);
+    }
+    return k;
+}
+
+static inline uint64_t pack_id(const char* p, uint32_t n) {
+#ifdef __AVX512BW__
+    if (n - 1 >= 10u) return 0;
+    const __mmask16 m = (__mmask16)_bzhi_u32(0xFFFF, n);
+    const __m128i v = _mm_maskz_loadu_epi8(m, p);  // masked: never reads past p + n
+    const __m128i d = _mm_sub_epi8(v, _mm_set1_epi8('0'));
+    const __m128i a = _mm_sub_epi8(v, _mm_set1_epi8('a'));
+    const __mmask16 isd = _mm_mask_cmplt_epu8_mask(m, d, _mm_set1_epi8(10));
+    const __mmask16 isa = _mm_mask_cmplt_epu8_mask(m, a, _mm_set1_epi8(26));
+    if ((__mmask16)(isd | isa) != m) return 0;
+    __m128i c = _mm_maskz_add_epi8(isd, d, _mm_set1_epi8(1));
+    c = _mm_mask_add_epi8(c, isa, a, _mm_set1_epi8(11));
+    const uint64_t lo = (uint64_t)_mm_cvtsi128_si64(c);
+    const uint32_t hi = (uint32_t)_mm_extract_epi16(c, 4);
+    return _pext_u64(lo, 0x3F3F3F3F3F3F3F3Full) | (uint64_t)_pext_u32(hi, 0x3F3F) << 48;
+#else
+    return pack_id_ref(p, n);
+#endif
+}
+
+// Inverse of pack_id; out needs 10 bytes. Returns the length.
+static inline uint32_t unpack_id(uint64_t k, char* out) {
+    uint32_t n = 0;
+    for (; k; k >>= 6) {
+        unsigned d = k & 63;
+        out[n++] = (char)(d <= 10 ? '0' + d - 1 : 'a' + d - 11);
+    }
+    return n;
+}
+
+// Keys with this bit are not packed IDs: fallback tables number them.
+static const uint64_t FBIT = 1ull << 63;
 
 static inline uint64_t mix(uint64_t a, uint64_t b) {
     __uint128_t r = (__uint128_t)a * b;

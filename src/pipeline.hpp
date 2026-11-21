@@ -108,14 +108,13 @@ struct Ctx {
 };
 
 // ---- links.cpp
-// user_id -> dense person id, concurrent. Link IDs are inserted first (ids 0..nodes-1) and point at their
-// union-find root; any other user is interned on first sight as a person of its own. names[pid] is the
-// person's name for every pid that is a root or an unlinked user.
-struct Persons {
+// User keys: pack_id(ID) when the ID is in that form, else FBIT | its number in FTab (exact compare). Rare in practice
+// (upper-cased IDs), so FTab is a lazily touched reservation.
+struct FTab {
     struct Slot {
         std::atomic<uint64_t> h;
-        std::atomic<uint32_t> h2;
-        std::atomic<uint32_t> id1;  // pid + 1, 0 while the inserting thread is still writing
+        std::atomic<uint32_t> id1;  // id + 1, 0 while the inserting thread is still writing
+        uint32_t pad;
     };
     Slot* s = nullptr;
     size_t mask = 0;
@@ -123,58 +122,84 @@ struct Persons {
     uint32_t* name_l = nullptr;
     std::atomic<uint32_t> next{0};
     uint32_t cap = 0;
-
     void init(size_t n);
-    ~Persons();
-    // pid of a user, inserting it with a fresh pid if missing; `slot` receives the slot index
-    uint32_t get(const char* p, uint32_t n, size_t* slot = nullptr) {
+    ~FTab();
+    uint32_t get(const char* p, uint32_t n) {
         uint64_t h = hash_bytes(p, n);
-        uint32_t h2v = hash2(p, n);
         if (!h) h = 1;
-        size_t i = h & mask;
-        for (;;) {
+        for (size_t i = h & mask;; i = (i + 1) & mask) {
             uint64_t cur = s[i].h.load(std::memory_order_relaxed);
-            if (cur == 0) {
-                if (s[i].h.compare_exchange_strong(cur, h, std::memory_order_relaxed)) {
-                    uint32_t id = next.fetch_add(1, std::memory_order_relaxed);
-                    if (id >= cap) { fprintf(stderr, "person table full\n"); abort(); }
-                    name_p[id] = p;
-                    name_l[id] = n;
-                    s[i].h2.store(h2v, std::memory_order_relaxed);
-                    s[i].id1.store(id + 1, std::memory_order_release);
-                    if (slot) *slot = i;
-                    return id;
-                }
+            if (cur == 0 && s[i].h.compare_exchange_strong(cur, h, std::memory_order_relaxed)) {
+                uint32_t id = next.fetch_add(1, std::memory_order_relaxed);
+                if (id >= cap) { fprintf(stderr, "fallback table full\n"); abort(); }
+                name_p[id] = p;
+                name_l[id] = n;
+                s[i].id1.store(id + 1, std::memory_order_release);
+                return id;
             }
             if (cur == h) {
                 uint32_t id1;
                 while (!(id1 = s[i].id1.load(std::memory_order_acquire))) {
                 }
-                if (s[i].h2.load(std::memory_order_relaxed) == h2v) {
-                    if (slot) *slot = i;
-                    return id1 - 1;
-                }
+                if (same(name_p[id1 - 1], name_l[id1 - 1], p, n)) return id1 - 1;
             }
-            i = (i + 1) & mask;
         }
     }
+    uint64_t key(const char* p, uint32_t n) {
+        uint64_t k = pack_id(p, n);
+        return k ? k : FBIT | get(p, n);
+    }
 };
-static inline uint32_t ppart(uint32_t pid) { return (pid * 0x9E3779B1u) >> (32 - PBITS); }
+
+// Link IDs only: user key -> the key of its person's name (the byte-wise smallest ID). A key not in the table is a
+// person of its own. While building, val holds node id + 1.
+struct Links {
+    struct Slot {
+        std::atomic<uint64_t> key;
+        std::atomic<uint64_t> val;
+    };
+    Slot* s = nullptr;
+    size_t mask = 0;
+    int shift = 64;
+    FTab F;
+    void init(size_t n);
+    ~Links();
+    size_t idx(uint64_t k) const { return (size_t)((k * 0xD6E8FEB86659FD93ull) >> shift); }
+    const void* at(uint64_t k) const { return &s[idx(k)]; }
+    uint64_t person(uint64_t k) const {
+        for (size_t i = idx(k);; i = (i + 1) & mask) {
+            uint64_t x = s[i].key.load(std::memory_order_relaxed);
+            if (x == k) return s[i].val.load(std::memory_order_relaxed);
+            if (!x) return k;
+        }
+    }
+    // the person's name: unpacked into buf, or the fallback table's bytes
+    const char* name(uint64_t k, char* buf, uint32_t& n) const {
+        if (k & FBIT) {
+            n = F.name_l[(uint32_t)k];
+            return F.name_p[(uint32_t)k];
+        }
+        n = unpack_id(k, buf);
+        return buf;
+    }
+};
+static inline uint32_t kpart(uint64_t k) { return (uint32_t)((k * 0x9E3779B97F4A7C15ull) >> (64 - PBITS)); }
 // est_users: an upper bound on distinct user IDs outside links
-void build_links(const Ctx& c, Persons& P, size_t est_users);
+void build_links(const Ctx& c, Links& L, size_t est_users);
 
 // ---- events.cpp
 struct SessEv {
     uint32_t ts;   // ms since window_start
-    uint32_t pid;
     uint32_t pc;   // price | cat << 24; price 0 for view and cart, >= 1 for a purchase
+    uint64_t key;  // person
 };
 
 struct ClickRec {
     uint32_t ts;   // ms since window_start - 7 days
-    uint32_t pid;
     uint32_t camp;
     uint32_t cidlen;
+    uint32_t pad;
+    uint64_t key;  // person
     const char* cid;
 };
 static const uint32_t PRICE_MASK = 0xFFFFFF;
@@ -188,11 +213,11 @@ struct CkParts {
     Arena arena;
     vector<vector<BList<ClickRec>>> p;
 };
-void parse_and_dedup(const Ctx& c, Persons& P, EvParts& sp, CkParts& ckp);
+void parse_and_dedup(const Ctx& c, Links& L, EvParts& sp, CkParts& ckp);
 
 // ---- sessions.cpp
 struct URow {
-    uint32_t pid;
+    uint64_t key;  // person
     int32_t day;
     int64_t sessions, events, revenue;
     int32_t topcat;  // -1 null
@@ -202,5 +227,4 @@ struct Agg {
     vector<vector<URow>> urows;                          // [thread]
     vector<vector<int64_t>> c_sess, c_purch, c_rev, c_assist;  // [thread][campaign * ndays + day]
 };
-// npid: number of person ids handed out (Persons::next)
-void sessions(const Ctx& c, uint32_t npid, EvParts& sp, CkParts& ckp, Agg& out);
+void sessions(const Ctx& c, EvParts& sp, CkParts& ckp, Agg& out);
