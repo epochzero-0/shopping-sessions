@@ -8,6 +8,7 @@ void Persons::init(size_t n) {
     size_t c = 1024;
     while (c < n * 2) c <<= 1;
     s = (Slot*)big_alloc(c * sizeof(Slot));
+    memset((void*)s, 0, c * sizeof(Slot));  // sequential first touch gets 2 MB pages; random touch by get() faults 4 KB
     mask = c - 1;
     cap = (uint32_t)(c * 7 / 8);
     name_p = (const char**)big_alloc(cap * sizeof(const char*));
