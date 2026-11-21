@@ -1,5 +1,5 @@
-// Minimal Parquet writer: uncompressed, one row group, one data page per column, PLAIN or dictionary
-// (PLAIN dictionary page + RLE_DICTIONARY data page).
+// Minimal Parquet writer: uncompressed, one row group, one data page per column, PLAIN, DELTA_BYTE_ARRAY or
+// dictionary (PLAIN dictionary page + RLE_DICTIONARY data page).
 #pragma once
 #include <cstdint>
 #include <cstdio>
@@ -58,6 +58,7 @@ struct Col {
     std::string data;  // page body
     std::string dict;  // PLAIN dictionary page body; used when ndict > 0, and then `data` holds the indices
     int32_t ndict = 0;
+    int enc = 0;  // data page encoding without a dictionary: 0 PLAIN, 7 DELTA_BYTE_ARRAY
 };
 
 static inline void put32(std::string& s, uint32_t v) { s.append((const char*)&v, 4); }
@@ -107,6 +108,48 @@ static void rle_hybrid(std::string& s, const uint32_t* v, size_t n, int bw) {
         }
         s[hdr] = (char)((g << 1) | 1);
     }
+}
+
+// DELTA_BINARY_PACKED of v[0..n): blocks of 128 values in 4 miniblocks of 32, each miniblock bit-packed at its own
+// width over (delta - the block's min delta); the last miniblock is zero-padded, empty ones have width 0.
+static void delta_packed(std::string& s, const int32_t* v, size_t n) {
+    auto zz = [](int64_t x) { return ((uint64_t)x << 1) ^ (uint64_t)(x >> 63); };
+    put_varint(s, 128);
+    put_varint(s, 4);
+    put_varint(s, n);
+    put_varint(s, zz(n ? v[0] : 0));
+    for (size_t i = 1; i < n; i += 128) {
+        const size_t m = n - i < 128 ? n - i : 128;
+        int64_t d[128], mn = INT64_MAX;
+        for (size_t k = 0; k < m; k++) {
+            d[k] = (int64_t)v[i + k] - v[i + k - 1];
+            if (d[k] < mn) mn = d[k];
+        }
+        put_varint(s, zz(mn));
+        uint64_t u[128] = {};
+        uint8_t w[4] = {};
+        for (size_t k = 0; k < m; k++) {
+            u[k] = (uint64_t)(d[k] - mn);
+            while (w[k / 32] < 64 && (u[k] >> w[k / 32])) w[k / 32]++;
+        }
+        s.append((const char*)w, 4);
+        for (size_t j = 0; j * 32 < m; j++) {
+            unsigned __int128 acc = 0;
+            int nb = 0;
+            for (size_t k = 32 * j; k < 32 * j + 32; k++) {
+                acc |= (unsigned __int128)u[k] << nb;
+                for (nb += w[j]; nb >= 8; nb -= 8) s.push_back((char)acc), acc >>= 8;
+            }
+        }
+    }
+}
+
+// DELTA_BYTE_ARRAY page body from per-value prefix lengths, suffix lengths and the concatenated suffixes.
+static inline void delta_bytes(std::string& s, const std::vector<int32_t>& pre, const std::vector<int32_t>& suf,
+                               const std::string& bytes) {
+    delta_packed(s, pre.data(), pre.size());
+    delta_packed(s, suf.data(), suf.size());
+    s += bytes;
 }
 
 // Integer value -> dictionary index, dictionary page body built in first-seen order (vb bytes per value).
@@ -198,7 +241,7 @@ static void write_parquet(const std::string& path, std::vector<Col>& cols, int64
         ph.i32(3, (int32_t)c.data.size());
         ph.open(5);
         ph.i32(1, (int32_t)nrows);
-        ph.i32(2, c.ndict ? 8 : 0);  // RLE_DICTIONARY or PLAIN
+        ph.i32(2, c.ndict ? 8 : c.enc);  // RLE_DICTIONARY, else PLAIN or DELTA_BYTE_ARRAY
         ph.i32(3, 3);
         ph.i32(4, 3);
         ph.close();
@@ -249,7 +292,7 @@ static void write_parquet(const std::string& path, std::vector<Col>& cols, int64
                 m.zz(8);
             } else {
                 m.lst(2, 5, 2);
-                m.zz(0);
+                m.zz(cols[i].enc);
                 m.zz(3);
             }
             m.lst(3, 8, 1);

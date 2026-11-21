@@ -243,11 +243,15 @@ static void load_small(const string& data, Ctx& c) {
 
 // ------------------------------------------------------------------ output
 
+static void write_campaign(const Ctx& c, Agg& A, const string& outdir);
+
+// Thread t's user_daily rows go to part-t; one more thread writes campaign_daily alongside.
 static void write_outputs(const Ctx& c, const Links& L, Agg& A, const string& outdir) {
     const int T = c.T;
     fs::create_directories(outdir + "/user_daily");
     fs::create_directories(outdir + "/campaign_daily");
-    parallel(T, [&](int t) {
+    parallel(T + 1, [&](int t) {
+        if (t == T) return write_campaign(c, A, outdir);
         auto& rows = A.urows[t];
         if (rows.empty() && t != 0) return;
         vector<Col> cols = {Col{"user_id", P_BYTES, false, 0, 1, {}}, Col{"day", P_INT32, false, 6, 6, {}},
@@ -255,23 +259,29 @@ static void write_outputs(const Ctx& c, const Links& L, Agg& A, const string& ou
                             Col{"top_category", P_BYTES, true, 0, 1, {}}};
         const size_t n = rows.size();
         if (n) {
-            // every column dictionary-encoded; a person's rows are adjacent, so user_id indices are runs
-            vector<uint32_t> ix(n), tix;
-            string names;
-            uint32_t nnames = 0;
-            uint64_t prev = 0;
+            // user_id as DELTA_BYTE_ARRAY: a person's rows are adjacent, so a repeated row is a whole-value prefix
+            // with an empty suffix, and each person's name bytes are stored once. The other columns are dictionaries.
+            vector<int32_t> pre(n), suf(n);
+            string sufs, prev;
+            uint64_t pkey = 0;
             for (size_t k = 0; k < n; k++) {
-                if (k == 0 || rows[k].key != prev) {
-                    prev = rows[k].key;
-                    char buf[16];
-                    uint32_t nl;
-                    const char* name = L.name(prev, buf, nl);
-                    bytes_val(names, name, nl);
-                    nnames++;
+                if (k && rows[k].key == pkey) {
+                    pre[k] = (int32_t)prev.size(), suf[k] = 0;
+                    continue;
                 }
-                ix[k] = nnames - 1;
+                pkey = rows[k].key;
+                char buf[16];
+                uint32_t nl;
+                const char* name = L.name(pkey, buf, nl);
+                uint32_t p = 0;
+                while (p < nl && p < prev.size() && name[p] == prev[p]) p++;
+                pre[k] = (int32_t)p, suf[k] = (int32_t)(nl - p);
+                sufs.append(name + p, nl - p);
+                prev.assign(name, nl);
             }
-            set_dict(cols[0], std::move(names), nnames, ix);
+            cols[0].enc = 7;
+            delta_bytes(cols[0].data, pre, suf, sufs);
+            vector<uint32_t> ix(n), tix;
             {
                 IntDict d(4);
                 for (size_t k = 0; k < n; k++) ix[k] = d.get(rows[k].day);
@@ -296,6 +306,10 @@ static void write_outputs(const Ctx& c, const Links& L, Agg& A, const string& ou
         }
         write_parquet(outdir + "/user_daily/part-" + std::to_string(t) + ".parquet", cols, (int64_t)n);
     });
+}
+
+static void write_campaign(const Ctx& c, Agg& A, const string& outdir) {
+    const int T = c.T;
     const size_t CD = (size_t)(c.NCAMP + 1) * c.ndays;
     for (int t = 1; t < T; t++)
         for (size_t k = 0; k < CD; k++) {
