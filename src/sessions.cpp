@@ -9,7 +9,7 @@ void sessions(const Ctx& c, EvParts& sp, CkParts& ckp, Agg& out) {
     const int NC = c.NC;
     const uint32_t NCAMP = c.NCAMP;
     const int ndays = c.ndays;
-    const int64_t day0 = c.day0;
+    const int64_t day0 = c.day0, ws = c.ws;
     out.urows.assign(T, {});
     const size_t CD = (size_t)(NCAMP + 1) * ndays;
     out.c_sess.assign(T, vector<int64_t>(CD));
@@ -80,10 +80,11 @@ void sessions(const Ctx& c, EvParts& sp, CkParts& ckp, Agg& out) {
                 };
                 size_t a = i;
                 while (a < j) {
-                    int64_t start = evs[a].ts;
+                    const int64_t start = evs[a].ts;          // ms since window_start
+                    const int64_t start_c = start + WEEK_MS;  // the same instant on the click scale
                     size_t b = a + 1;
                     while (b < j && evs[b].ts - evs[b - 1].ts <= GAP_MS) b++;
-                    int64_t day = start / DAY_MS;
+                    int64_t day = (ws + start) / DAY_MS;
                     if (day != cur_day) {
                         flush();
                         cur_day = day, us = ue = ur = 0, anycat = false;
@@ -91,19 +92,19 @@ void sessions(const Ctx& c, EvParts& sp, CkParts& ckp, Agg& out) {
                     int64_t rev = 0;
                     bool purchased = false;
                     for (size_t x = a; x < b; x++)
-                        if (evs[x].purchase) {
+                        if (uint32_t price = evs[x].pc & PRICE_MASK) {
                             purchased = true;
-                            rev += evs[x].price;
-                            catrev[evs[x].cat] += evs[x].price;
+                            rev += price;
+                            catrev[evs[x].pc >> 24] += price;
                             anycat = true;
                         }
                     us++, ue += (int64_t)(b - a), ur += rev;
                     // clicks: window [start - 7d, start]
-                    while (hi < ce && cks[hi].ts <= start) {
+                    while (hi < ce && cks[hi].ts <= start_c) {
                         if (ccount[cks[hi].camp]++ == 0) active.push_back(cks[hi].camp);
                         hi++;
                     }
-                    while (lo < hi && cks[lo].ts < start - WEEK_MS) {
+                    while (lo < hi && cks[lo].ts < start) {
                         ccount[cks[lo].camp]--;
                         lo++;
                     }

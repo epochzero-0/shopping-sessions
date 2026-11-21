@@ -6,17 +6,17 @@
 #include "pipeline.hpp"
 
 namespace {
+// 32 B. event_id is identified by 96 bits of hash, so dedup never reads the CSV bytes back.
 struct EvRec {
-    uint64_t h;  // hash of event_id
-    int64_t ingest;
-    int64_t ts;
-    const char* eid;
-    uint32_t eidlen;
-    uint32_t pid;  // person, resolved at parse so no later phase reads the CSV bytes back
-    int32_t price;
-    uint8_t cat;
-    uint8_t flags;  // 1 valid, 2 purchase
+    uint64_t h;      // hash_bytes(event_id)
+    uint32_t h2;     // hash2(event_id)
+    uint32_t ingest; // seconds since epoch
+    uint32_t ts;     // ms since window_start
+    uint32_t pid;    // person, resolved at parse
+    uint32_t pc;     // price | cat << 24
+    uint32_t flags;  // 1 valid
 };
+static_assert(sizeof(EvRec) == 32, "EvRec");
 }  // namespace
 
 void parse_and_dedup(const Ctx& c, Persons& P, EvParts& sp, CkParts& ckp) {
@@ -42,20 +42,19 @@ void parse_and_dedup(const Ctx& c, Persons& P, EvParts& sp, CkParts& ckp) {
                         if (!split<7>(b, e, fp, fl) || !fl[0]) return;
                         EvRec r;
                         r.h = hash_bytes(fp[0], fl[0]);
-                        r.eid = fp[0];
-                        r.eidlen = fl[0];
-                        if (!parse_ts(fp[3], fl[3], r.ingest)) r.ingest = INT64_MAX;
+                        r.h2 = hash2(fp[0], fl[0]);
+                        int64_t ingest, ts = 0, price = 0;
+                        if (!parse_ts(fp[3], fl[3], ingest)) ingest = INT64_MAX;
+                        r.ingest = ingest < 0 ? 0 : (uint32_t)std::min<int64_t>(ingest / 1000, UINT32_MAX);
                         r.flags = 0;
-                        r.price = 0;
-                        r.cat = 0;
+                        r.pc = 0;
                         r.pid = 0;
                         r.ts = 0;
-                        bool ok = fl[1] && fl[5] && parse_ts(fp[2], fl[2], r.ts) && r.ts >= ws && r.ts < we;
+                        bool ok = fl[1] && fl[5] && parse_ts(fp[2], fl[2], ts) && ts >= ws && ts < we;
                         if (ok) {
                             const char* ty = fp[4];
                             uint32_t tl = fl[4];
                             if (tl == 8 && memcmp(ty, "purchase", 8) == 0) {
-                                r.flags |= 2;
                                 const char* pp = fp[6];
                                 uint32_t pl = fl[6];
                                 uint32_t i = 0;
@@ -68,18 +67,20 @@ void parse_and_dedup(const Ctx& c, Persons& P, EvParts& sp, CkParts& ckp) {
                                     int64_t v = 0;
                                     for (; i < pl; i++) v = v * 10 + (pp[i] - '0');
                                     if (v < 1 || v > 10000000) ok = false;
-                                    r.price = (int32_t)v;
+                                    price = v;
                                 }
                             } else if (!(tl == 4 && (memcmp(ty, "view", 4) == 0 || memcmp(ty, "cart", 4) == 0))) {
                                 ok = false;
                             }
                         }
-                        if (ok && r.ingest - r.ts > DAY_MS) ok = false;
+                        if (ok && ingest - ts > DAY_MS) ok = false;
                         if (ok) {
                             int64_t pi = c.prodmap.find(hash_bytes(fp[5], fl[5]), fp[5], fl[5]);
-                            r.cat = pi < 0 ? c.unknown_cat : c.prodcat[pi];
+                            uint32_t cat = pi < 0 ? c.unknown_cat : c.prodcat[pi];
+                            r.pc = (uint32_t)price | cat << 24;
+                            r.ts = (uint32_t)(ts - ws);
                             r.pid = P.get(fp[1], fl[1]);
-                            r.flags |= 1;
+                            r.flags = 1;
                         }
                         ev[r.h >> (64 - PBITS)].push_back(r);
                     });
@@ -94,7 +95,7 @@ void parse_and_dedup(const Ctx& c, Persons& P, EvParts& sp, CkParts& ckp) {
                         if (!parse_ts(fp[3], fl[3], ts) || ts < ws - WEEK_MS || ts >= we) return;
                         ClickRec r;
                         r.pid = P.get(fp[1], fl[1]);
-                        r.ts = ts;
+                        r.ts = (uint32_t)(ts - (ws - WEEK_MS));
                         r.cid = fp[0];
                         r.cidlen = fl[0];
                         r.camp = (uint32_t)camp;
@@ -136,7 +137,7 @@ void parse_and_dedup(const Ctx& c, Persons& P, EvParts& sp, CkParts& ckp) {
                             table[i] = &r;
                             break;
                         }
-                        if (x->h == r.h && same(x->eid, x->eidlen, r.eid, r.eidlen)) {
+                        if (x->h == r.h && x->h2 == r.h2) {
                             if (r.ingest < x->ingest) table[i] = &r;
                             break;
                         }
@@ -146,12 +147,7 @@ void parse_and_dedup(const Ctx& c, Persons& P, EvParts& sp, CkParts& ckp) {
             for (EvRec* x : table) {
                 if (!x || !(x->flags & 1)) continue;
                 SessEv e;
-                e.pid = x->pid;
-                e.ts = x->ts;
-                e.price = x->price;
-                e.cat = x->cat;
-                e.purchase = (x->flags & 2) ? 1 : 0;
-                sp[t][ppart(e.pid)].push_back(e);
+                sp[t][ppart(x->pid)].push_back({x->ts, x->pid, x->pc});
             }
             for (int s = 0; s < T; s++) vector<EvRec>().swap(evp[s][q]);
         }

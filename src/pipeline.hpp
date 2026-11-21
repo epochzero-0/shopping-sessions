@@ -109,20 +109,19 @@ void build_links(const Ctx& c, Persons& P, size_t est_users);
 
 // ---- events.cpp
 struct SessEv {
-    int64_t ts;
+    uint32_t ts;   // ms since window_start
     uint32_t pid;
-    int32_t price;
-    uint8_t cat;
-    uint8_t purchase;
+    uint32_t pc;   // price | cat << 24; price 0 for view and cart, >= 1 for a purchase
 };
 
 struct ClickRec {
-    int64_t ts;
-    const char* cid;
-    uint32_t cidlen;
+    uint32_t ts;   // ms since window_start - 7 days
     uint32_t pid;
     uint32_t camp;
+    uint32_t cidlen;
+    const char* cid;
 };
+static const uint32_t PRICE_MASK = 0xFFFFFF;
 
 // [thread][person partition]
 using EvParts = vector<vector<vector<SessEv>>>;

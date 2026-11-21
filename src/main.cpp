@@ -135,6 +135,10 @@ static void load_small(const string& data, Ctx& c) {
         grab("\"window_start\"", c.ws);
         grab("\"window_end\"", c.we);
     }
+    if (c.we - c.ws + WEEK_MS >= (1LL << 32) || c.ws < WEEK_MS) {
+        fprintf(stderr, "window does not fit 32-bit ms offsets\n");
+        exit(1);
+    }
     c.day0 = (c.ws >= 0 ? c.ws / DAY_MS : -((-c.ws + DAY_MS - 1) / DAY_MS));
     c.ndays = (int)(((c.we - 1) >= 0 ? (c.we - 1) / DAY_MS : -1) - c.day0 + 1);
 
