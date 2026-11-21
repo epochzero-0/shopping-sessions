@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <mutex>
 
 #include "csv.hpp"
 #include "parquet.hpp"
@@ -42,14 +43,29 @@ struct File {
     size_t n = 0;
 };
 
+// Live big_alloc regions, released in parallel before _exit.
+static std::mutex g_big_mu;
+static vector<std::pair<void*, size_t>> g_big;
+
 void* big_alloc(size_t bytes) {
     void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (p == MAP_FAILED) { perror("mmap"); exit(1); }
     madvise(p, bytes, MADV_HUGEPAGE);
+    std::lock_guard<std::mutex> g(g_big_mu);
+    g_big.push_back({p, bytes});
     return p;
 }
 
-void big_free(void* p, size_t bytes) { munmap(p, bytes); }
+void big_free(void* p, size_t bytes) {
+    munmap(p, bytes);
+    std::lock_guard<std::mutex> g(g_big_mu);
+    for (auto& r : g_big)
+        if (r.first == p) {
+            r = g_big.back();
+            g_big.pop_back();
+            break;
+        }
+}
 
 static vector<File> g_files;  // unmapped at the end of each run
 
@@ -329,6 +345,35 @@ static void record_run() {
     if (g_runs > 1) fprintf(stderr, "run %d: %.3f s\n", g_run + 1, total);
 }
 
+// MADV_DONTNEED every big region and input mapping, split into T equal 2 MB-aligned slices of their concatenation,
+// so the unmap at exit has little left to tear down single-threaded.
+static void release_parallel(int T) {
+    const size_t G = 2 << 20, PG = 4096;
+    struct R {
+        char* p;
+        size_t n;  // mapped bytes, rounded up to a page; never past the mapping
+    };
+    vector<R> r;
+    for (auto& b : g_big) r.push_back({(char*)b.first, (b.second + PG - 1) / PG * PG});
+    for (auto& f : g_files)
+        if (f.n) r.push_back({(char*)f.p, (f.n + PG - 1) / PG * PG});
+    size_t total = 0;  // each region takes a G-aligned span of the concatenation
+    for (auto& x : r) total += (x.n + G - 1) / G * G;
+    const size_t slice = (total / T + G - 1) / G * G;
+    if (!slice) return;
+    parallel(T, [&](int t) {
+        const size_t lo = (size_t)t * slice, hi = lo + slice;
+        size_t off = 0;
+        for (auto& x : r) {
+            const size_t a = std::max(lo, off), b = std::min(hi, off + x.n);
+            if (a < b) madvise(x.p + (a - off), b - a, MADV_DONTNEED);
+            off += (x.n + G - 1) / G * G;
+        }
+    });
+}
+
+static int g_T = 1;
+
 // Outputs are closed; skip every destructor and free.
 [[noreturn]] static void report_and_exit() {
     if (g_runs > 1) {
@@ -343,6 +388,7 @@ static void record_run() {
                 fputs(line, stderr);
         fclose(st);
     }
+    release_parallel(g_T);
     _exit(0);
 }
 
@@ -375,6 +421,7 @@ int main(int argc, char** argv) {
     int T = std::max(1, std::min(nc ? atoi(nc) : (int)std::thread::hardware_concurrency(), 64));
     const char* bn = getenv("BENCH");
     g_runs = bn ? std::max(1, atoi(bn)) : 1;
+    g_T = T;
     for (g_run = 0; g_run < g_runs; g_run++) {
         g_phases.clear();
         g_t0 = g_last = std::chrono::steady_clock::now();
