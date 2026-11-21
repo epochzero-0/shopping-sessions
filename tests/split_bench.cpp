@@ -137,13 +137,24 @@ static double ladder(const std::vector<Chunk>& ch, const Ctx& c, Links& K, int T
         R = 5;
     }
     const int64_t ws = c.ws, we = c.we;
+    DirectIdx dprod, dcamp;  // as events.cpp
+    dprod.build(c.prodmap, "p", [&](uint32_t i) { return (uint32_t)c.prodcat[i]; });
+    dcamp.build(c.campmap, "c_", [](uint32_t i) { return i; });
     std::atomic<size_t> next{0};
     std::atomic<uint64_t> tot{0}, cnt{0};
     auto t0 = std::chrono::steady_clock::now();
     parallel(T, [&](int t) {
         uint64_t s = 0, n = 0;
-        auto& ev = L.ev[t];
-        auto& ck = L.ck[t];
+        WCLists<EvRec> ev(L.ev[t], L.eva);
+        WCLists<ClickRec> ck(L.ck[t], L.cka);
+        const uint32_t RING = 8;
+        ClickRec ring[RING];
+        uint32_t rn = 0;
+        auto click_out = [&](ClickRec& r) {
+            r.key = K.person(r.key);
+            s += r.key;
+            ck.push(kpart(r.key), r);
+        };
         for (size_t k; (k = next++) < ch.size();) {
             const Chunk& x = ch[k];
             if (x.kind == 7) {
@@ -192,8 +203,14 @@ static double ladder(const std::vector<Chunk>& ch, const Ctx& c, Links& K, int T
                     if (ok) {
                         r.ts = (uint32_t)(ts - ws);
                         if (R >= 3) {
-                            int64_t pi = c.prodmap.find(hp, fp[5], fl[5]);
-                            r.pc = (uint32_t)price | (uint32_t)(pi < 0 ? 255 : c.prodcat[pi]) << 24;
+                            int64_t cat;
+                            if (dprod.on) {
+                                cat = dprod.find(fp[5], fl[5]);
+                            } else {
+                                cat = c.prodmap.find(hp, fp[5], fl[5]);
+                                if (cat >= 0) cat = c.prodcat[cat];
+                            }
+                            r.pc = (uint32_t)price | (uint32_t)(cat < 0 ? 255 : cat) << 24;
                         } else {
                             r.pc = (uint32_t)price ^ (uint32_t)hp;
                         }
@@ -201,7 +218,7 @@ static double ladder(const std::vector<Chunk>& ch, const Ctx& c, Links& K, int T
                     }
                     if (R < 5) { s += r.ek ^ r.eh2 ^ r.ingest ^ r.ts ^ r.pc ^ r.uk; return; }
                     s += r.uk;
-                    ev[kpart(r.ek)].push(L.eva, r);
+                    ev.push(kpart(r.ek), r);
                 });
             } else {
                 scan_lines<4>(x.b, x.e, [&](const char* const* fp, const uint32_t* fl) {
@@ -214,20 +231,29 @@ static double ladder(const std::vector<Chunk>& ch, const Ctx& c, Links& K, int T
                     int64_t ts;
                     if (!parse_ts(fp[3], fl[3], ts) || ts < ws - WEEK_MS || ts >= we) return;
                     int64_t camp = (int64_t)(hc & 7);
-                    if (R >= 3 && (camp = c.campmap.find(hc, fp[2], fl[2])) < 0) return;
-                    ClickRec r;
-                    r.key = R >= 4 ? K.person(uk) : uk;
+                    if (R >= 3 && (camp = dcamp.on ? dcamp.find(fp[2], fl[2]) : c.campmap.find(hc, fp[2], fl[2])) < 0)
+                        return;
+                    if (R < 5) {
+                        const uint64_t key = R >= 4 ? K.person(uk) : uk;
+                        s += key ^ (uint32_t)(ts - (ws - WEEK_MS)) ^ (uint64_t)camp ^ fl[0];
+                        return;
+                    }
+                    ClickRec& r = ring[rn % RING];  // as events.cpp
+                    if (rn >= RING) click_out(r);
+                    rn++;
+                    r.key = uk;
+                    __builtin_prefetch(K.at(uk));
                     r.ts = (uint32_t)(ts - (ws - WEEK_MS));
                     r.cid = fp[0];
                     r.cidlen = fl[0];
                     r.pad = 0;
                     r.camp = (uint32_t)camp;
-                    if (R < 5) { s += r.key ^ r.ts ^ r.camp ^ r.cidlen; return; }
-                    s += r.key;
-                    ck[kpart(r.key)].push(L.cka, r);
                 });
             }
         }
+        for (uint32_t i = rn > RING ? rn - RING : 0; i < rn; i++) click_out(ring[i % RING]);
+        ev.flush();
+        ck.flush();
         tot += s;
         cnt += n;
     });

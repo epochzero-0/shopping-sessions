@@ -9,6 +9,9 @@
 #include <vector>
 
 #include "hash.hpp"
+#ifdef __AVX512F__
+#include <immintrin.h>
+#endif
 
 using std::string;
 using std::vector;
@@ -47,7 +50,7 @@ struct Arena {
         size_t o = used.fetch_add(bytes, std::memory_order_relaxed);
         if (o + bytes <= cap) return base + o;
         spilled.fetch_add(1, std::memory_order_relaxed);
-        return malloc(bytes);  // rare; leaked until exit
+        return aligned_alloc(64, bytes);  // rare; leaked until exit. 64 B aligned for WCLists
     }
     ~Arena() {
         if (base) big_free(base, cap);
@@ -69,6 +72,17 @@ struct BList {
         }
         cur[last++] = x;
     }
+    // room for k records in one go (B % k == 0, so a 64 B group never straddles blocks)
+    T* reserve(Arena& A, uint32_t k) {
+        if (__builtin_expect(last == B, 0)) {
+            cur = (T*)A.take(B * sizeof(T));
+            blocks.push_back(cur);
+            last = 0;
+        }
+        T* p = cur + last;
+        last += k;
+        return p;
+    }
     size_t size() const { return blocks.empty() ? 0 : (blocks.size() - 1) * B + last; }
     template <class F>
     void each(F f) const {
@@ -81,6 +95,42 @@ struct BList {
     template <class F>
     void each_block(F f) const {
         for (size_t k = 0; k < blocks.size(); k++) f(blocks[k], k + 1 == blocks.size() ? last : B);
+    }
+};
+
+// One thread's NPART BLists behind write-combining buffers: records collect in a 64 B line per partition (L1) and
+// go out as one streaming store, so the destination line is never read. Record order per partition is unchanged.
+// Call flush() once when the thread is done.
+template <class T>
+struct WCLists {
+    static constexpr uint32_t K = 64 / sizeof(T);
+    static_assert(64 % sizeof(T) == 0 && BList<T>::B % K == 0, "WCLists");
+    struct alignas(64) Line {
+        T r[K];
+    };
+    vector<Line> line;
+    vector<uint8_t> n;
+    vector<BList<T>>* out;
+    Arena* A;
+    WCLists(vector<BList<T>>& o, Arena& a) : line(o.size()), n(o.size(), 0), out(&o), A(&a) {}
+    void push(uint32_t q, const T& x) {
+        line[q].r[n[q]] = x;
+        if (++n[q] == K) {
+            n[q] = 0;
+            T* d = (*out)[q].reserve(*A, K);
+#ifdef __AVX512F__
+            _mm512_stream_si512((__m512i*)d, _mm512_load_si512(&line[q]));
+#else
+            memcpy(d, &line[q], 64);
+#endif
+        }
+    }
+    void flush() {
+        for (size_t q = 0; q < n.size(); q++)
+            for (uint32_t i = 0; i < n[q]; i++) (*out)[q].push(*A, line[q].r[i]);
+#ifdef __AVX512F__
+        _mm_sfence();
+#endif
     }
 };
 

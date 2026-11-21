@@ -139,7 +139,97 @@ static inline bool d2(const char* p, unsigned& v) {
     return true;
 }
 
-static inline bool parse_ts(const char* p, uint32_t n, int64_t& out) {
+#ifdef __AVX512BW__
+// Months 1970-01 .. 2099-12: day number of the 1st and the month's length.
+struct MonthTab {
+    static const int Y0 = 1970, NY = 130;
+    int32_t first[NY * 12];
+    uint8_t len[NY * 12];
+    MonthTab() {
+        static const unsigned char dim[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+        for (int y = 0; y < NY; y++)
+            for (int m = 0; m < 12; m++) {
+                const int Y = Y0 + y;
+                first[y * 12 + m] = (int32_t)days_from_civil(Y, m + 1, 1);
+                len[y * 12 + m] = dim[m] + (m == 1 && ((Y % 4 == 0 && Y % 100 != 0) || Y % 400 == 0));
+            }
+    }
+};
+static const MonthTab g_months;
+
+// "YYYY-MM-DDTHH:MM:SS" at p[0..18] (caller guarantees 19 readable bytes) -> seconds since epoch.
+// One 16 B load: digit and separator checks as one movemask, digit pairs by pshufb + pmaddubsw.
+__attribute__((always_inline)) static inline bool f1_secs(const char* p, int64_t& secs) {
+    const __m128i v = _mm_loadu_si128((const __m128i*)p);  // "YYYY-MM-DDTHH:MM"
+    const __m128i d = _mm_sub_epi8(v, _mm_set1_epi8('0'));
+    const __m128i isd = _mm_cmpeq_epi8(_mm_min_epu8(d, _mm_set1_epi8(9)), d);
+    const __m128i sep = _mm_cmpeq_epi8(v, _mm_setr_epi8(0, 0, 0, 0, '-', 0, 0, '-', 0, 0, 'T', 0, 0, ':', 0, 0));
+    uint32_t s2;
+    memcpy(&s2, p + 15, 4);  // "M:SS"
+    const uint32_t t = s2 - 0x30303000u;  // bytes 1..3 minus '0' (byte 0 is the minute digit, unused)
+    if ((((unsigned)_mm_movemask_epi8(isd) & 0xDB6F) | ((unsigned)_mm_movemask_epi8(sep) & 0x2490)) != 0xFFFF ||
+        (s2 >> 8 & 0xFF) != ':' || ((t >> 16) & 0xFF) > 9 || (t >> 24) > 9)
+        return false;
+    const __m128i pr = _mm_maddubs_epi16(
+        _mm_shuffle_epi8(d, _mm_setr_epi8(0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, -1, -1, -1, -1)),
+        _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0));
+    const unsigned y = (unsigned)_mm_extract_epi16(pr, 0) * 100 + (unsigned)_mm_extract_epi16(pr, 1);
+    const unsigned mo = (unsigned)_mm_extract_epi16(pr, 2), dd = (unsigned)_mm_extract_epi16(pr, 3);
+    const unsigned h = (unsigned)_mm_extract_epi16(pr, 4), mi = (unsigned)_mm_extract_epi16(pr, 5);
+    const unsigned s = ((t >> 16) & 0xFF) * 10 + (t >> 24);
+    if (y - MonthTab::Y0 >= (unsigned)MonthTab::NY || mo - 1 > 11u) return false;  // the slow path decides
+    const unsigned ym = (y - MonthTab::Y0) * 12 + mo - 1;
+    if (dd - 1 >= g_months.len[ym] || h > 23 || mi > 59 || s > 59) return false;
+    secs = (int64_t)(g_months.first[ym] + (int32_t)dd - 1) * 86400 + (h * 3600 + mi * 60 + s);
+    return true;
+}
+
+// Lemire SWAR: 8 ASCII digits (first digit in the low byte) -> value; false if any byte is not a digit.
+static inline bool swar8(uint64_t v, uint64_t& out) {
+    if (((v + 0x4646464646464646ull) | (v - 0x3030303030303030ull)) & 0x8080808080808080ull) return false;
+    v = (v & 0x0F0F0F0F0F0F0F0Full) * 2561 >> 8;
+    v = (v & 0x00FF00FF00FF00FFull) * 6553601 >> 16;
+    out = (v & 0x0000FFFF0000FFFFull) * 42949672960001ull >> 32;
+    return true;
+}
+#endif
+
+__attribute__((noinline)) static bool parse_ts_slow(const char* p, uint32_t n, int64_t& out);
+
+// Fast paths for the generator's shapes (F1 20 B, F2 25 B, F3 13 digits); anything else -> parse_ts_slow.
+__attribute__((always_inline)) static inline bool parse_ts(const char* p, uint32_t n, int64_t& out) {
+#ifdef __AVX512BW__
+    if (n == 20) {
+        int64_t s;
+        if (p[19] == 'Z' && f1_secs(p, s)) {
+            out = s * 1000;
+            return true;
+        }
+    } else if (n == 13) {
+        uint64_t a, b, hi, lo;
+        memcpy(&a, p, 8);
+        memcpy(&b, p + 5, 8);
+        if (swar8(a << 24 | 0x303030ull, hi) && swar8(b, lo)) {  // digits 0..4 as 000ddddd, digits 5..12
+            out = (int64_t)(hi * 100000000ull + lo);
+            return true;
+        }
+        return false;  // 13 bytes, not all digits: no other form has 13 bytes
+    } else if (n == 25) {
+        int64_t s;
+        const char sg = p[19];
+        unsigned oh, om;
+        if ((sg == '+' || sg == '-') && p[22] == ':' && f1_secs(p, s) && d2(p + 20, oh) && d2(p + 23, om) &&
+            oh <= 23 && om <= 59) {
+            const int64_t off = (int64_t)(oh * 60 + om) * 60000;
+            out = s * 1000 - (sg == '-' ? -off : off);
+            return true;
+        }
+    }
+#endif
+    return parse_ts_slow(p, n, out);
+}
+
+__attribute__((noinline)) static bool parse_ts_slow(const char* p, uint32_t n, int64_t& out) {
     if (n == 0) return false;
     if ((n == 20 || n == 25) && p[4] == '-') {
         unsigned y1, y2, mo, d, h, mi, s;

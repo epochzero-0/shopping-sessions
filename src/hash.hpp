@@ -159,3 +159,56 @@ struct StrMap {
         return -1;
     }
 };
+
+// <prefix><1..7 digits, no leading zero> -> array index (products p123, campaigns c_123). Built from a StrMap only
+// when every key has that form, so an ID outside the form is absent from the map too: exact.
+struct DirectIdx {
+    bool on = false;
+    uint32_t plen = 0;
+    char pre[4] = {};
+    std::vector<uint32_t> val;  // f(map value) + 1; 0 = absent
+    static bool num(const char* p, uint32_t k, uint64_t& out) {  // k digits, canonical
+        if (k - 1 >= 7u || (k > 1 && p[0] == '0')) return false;
+#ifdef __AVX512BW__
+        uint64_t v = (uint64_t)_mm_cvtsi128_si64(_mm_maskz_loadu_epi8(_bzhi_u32(0xFFFF, k), p));
+        v = v << (8 * (8 - k)) | 0x3030303030303030ull >> (8 * k);  // right-aligned, '0'-padded
+        if (((v + 0x4646464646464646ull) | (v - 0x3030303030303030ull)) & 0x8080808080808080ull) return false;
+        v = (v & 0x0F0F0F0F0F0F0F0Full) * 2561 >> 8;
+        v = (v & 0x00FF00FF00FF00FFull) * 6553601 >> 16;
+        out = (v & 0x0000FFFF0000FFFFull) * 42949672960001ull >> 32;
+#else
+        out = 0;
+        for (uint32_t i = 0; i < k; i++) {
+            if ((unsigned char)p[i] - '0' > 9u) return false;
+            out = out * 10 + (p[i] - '0');
+        }
+#endif
+        return true;
+    }
+    template <class F>
+    void build(const StrMap& m, const char* prefix, F f) {
+        plen = (uint32_t)strlen(prefix);
+        memcpy(pre, prefix, plen);
+        uint64_t mx = 0, x;
+        for (size_t i = 0; i < m.v.size(); i++) {
+            if (!m.v[i]) continue;
+            if (m.sl[i] <= plen || memcmp(m.sp[i], pre, plen) || !num(m.sp[i] + plen, m.sl[i] - plen, x)) return;
+            if (x > mx) mx = x;
+        }
+        val.assign(mx + 1, 0);
+        for (size_t i = 0; i < m.v.size(); i++)
+            if (m.v[i]) {
+                num(m.sp[i] + plen, m.sl[i] - plen, x);
+                val[x] = f(m.v[i] - 1) + 1;
+            }
+        on = true;
+    }
+    // f(value) of the map entry, or -1 when absent
+    int64_t find(const char* p, uint32_t n) const {
+        uint64_t x;
+        if (n <= plen || p[0] != pre[0] || (plen > 1 && p[1] != pre[1]) || !num(p + plen, n - plen, x) ||
+            x >= val.size())
+            return -1;
+        return (int64_t)val[x] - 1;
+    }
+};
