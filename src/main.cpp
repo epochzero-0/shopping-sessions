@@ -42,6 +42,15 @@ struct File {
     size_t n = 0;
 };
 
+void* big_alloc(size_t bytes) {
+    void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (p == MAP_FAILED) { perror("mmap"); exit(1); }
+    madvise(p, bytes, MADV_HUGEPAGE);
+    return p;
+}
+
+void big_free(void* p, size_t bytes) { munmap(p, bytes); }
+
 static vector<File> g_files;  // unmapped at the end of each run
 
 static File map_file(const string& path) {
@@ -295,6 +304,39 @@ static void write_outputs(const Ctx& c, const Persons& P, Agg& A, const string& 
 
 // ------------------------------------------------------------------ main
 
+static int g_runs = 1, g_run = 0;
+static vector<std::pair<string, double>> g_best;
+static double g_best_total = 1e30;
+
+static void record_run() {
+    double total = 0;
+    for (auto& p : g_phases) total += p.second;
+    g_best_total = std::min(g_best_total, total);
+    if (g_run == 0)
+        g_best = g_phases;
+    else
+        for (size_t i = 0; i < g_best.size() && i < g_phases.size(); i++)
+            g_best[i].second = std::min(g_best[i].second, g_phases[i].second);
+    if (g_runs > 1) fprintf(stderr, "run %d: %.3f s\n", g_run + 1, total);
+}
+
+// Outputs are closed; skip every destructor and free.
+[[noreturn]] static void report_and_exit() {
+    if (g_runs > 1) {
+        fprintf(stderr, "BENCH min of %d:", g_runs);
+        for (auto& p : g_best) fprintf(stderr, " %s %.3f ·", p.first.c_str(), p.second);
+        fprintf(stderr, " total %.3f s\n", g_best_total);
+    }
+    if (FILE* st = fopen("/proc/self/status", "r")) {
+        char line[256];
+        while (fgets(line, sizeof line, st))
+            if (!strncmp(line, "VmHWM", 5) || !strncmp(line, "RssFile", 7) || !strncmp(line, "RssAnon", 7))
+                fputs(line, stderr);
+        fclose(st);
+    }
+    _exit(0);
+}
+
 static void run_once(const string& data, const string& outdir, int T) {
     Ctx c;
     c.T = T;
@@ -310,6 +352,9 @@ static void run_once(const string& data, const string& outdir, int T) {
     phase("sessions");
     write_outputs(c, P, A, outdir);
     phase("write");
+    if (ckp.arena.spilled || sp.arena.spilled) fprintf(stderr, "arena spilled\n");
+    record_run();
+    if (g_run == g_runs - 1) report_and_exit();
     unmap_all();
 }
 
@@ -320,37 +365,10 @@ int main(int argc, char** argv) {
     const char* nc = getenv("NCPU");
     int T = std::max(1, std::min(nc ? atoi(nc) : (int)std::thread::hardware_concurrency(), 64));
     const char* bn = getenv("BENCH");
-    int runs = bn ? std::max(1, atoi(bn)) : 1;
-
-    vector<std::pair<string, double>> best;
-    double best_total = 1e30;
-    for (int r = 0; r < runs; r++) {
+    g_runs = bn ? std::max(1, atoi(bn)) : 1;
+    for (g_run = 0; g_run < g_runs; g_run++) {
         g_phases.clear();
         g_t0 = g_last = std::chrono::steady_clock::now();
         run_once(data, outdir, T);
-        double total = 0;
-        for (auto& p : g_phases) total += p.second;
-        best_total = std::min(best_total, total);
-        if (r == 0)
-            best = g_phases;
-        else
-            for (size_t i = 0; i < best.size() && i < g_phases.size(); i++)
-                best[i].second = std::min(best[i].second, g_phases[i].second);
-        if (runs > 1) fprintf(stderr, "run %d: %.3f s\n", r + 1, total);
     }
-    if (runs > 1) {
-        fprintf(stderr, "BENCH min of %d:", runs);
-        for (auto& p : best) fprintf(stderr, " %s %.3f ·", p.first.c_str(), p.second);
-        fprintf(stderr, " total %.3f s\n", best_total);
-    }
-#ifndef _WIN32
-    if (FILE* st = fopen("/proc/self/status", "r")) {
-        char line[256];
-        while (fgets(line, sizeof line, st))
-            if (!strncmp(line, "VmHWM", 5) || !strncmp(line, "RssFile", 7) || !strncmp(line, "RssAnon", 7))
-                fputs(line, stderr);
-        fclose(st);
-    }
-#endif
-    return 0;
 }

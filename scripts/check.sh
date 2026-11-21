@@ -1,6 +1,6 @@
 #!/bin/sh
 # Build, then fixtures + dev + seed 2 (5M) + seed 3 (2M) against the oracles, then 20M timing.
-# Prints one line:  PASS fx 36/36 dev s2 s3 | 20M 4.80 s (BENCH min of 3: parse 1.6 ...)
+# Prints one line:  PASS fx 36/36 dev s2 s3 | 20M 3.82 s, run 1 4.1 s, peak 3.4 GB (min of 3: ...)
 # check.sh -q skips the 20M timing.  Logs: build/check/*.log
 set -u
 cd "$(dirname "$0")/.."
@@ -28,6 +28,7 @@ if [ "${1:-}" != "-q" ]; then
   B=$(grep '^BENCH' "$L/20m.log")
   TOT=$(echo "$B" | sed 's/.*total \([0-9.]*\) s.*/\1/')
   HWM=$(grep VmHWM "$L/20m.log" | awk '{printf "%.1f GB", $2/1048576}')
-  LINE="$LINE | 20M $TOT s, peak $HWM ($(echo "$B" | sed 's/^BENCH //; s/ total.*//'))"
+  RUN1=$(grep '^run 1:' "$L/20m.log" | sed 's/run 1: //')
+  LINE="$LINE | 20M $TOT s, run 1 $RUN1, peak $HWM ($(echo "$B" | sed 's/^BENCH //; s/ total.*//'))"
 fi
 echo "$LINE"

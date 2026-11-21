@@ -28,6 +28,62 @@ static void parallel(int n, F f) {
     for (auto& t : ts) t.join();
 }
 
+// ---- memory (main.cpp)
+// Zeroed, lazily committed, transparent-huge-page backed.
+void* big_alloc(size_t bytes);
+void big_free(void* p, size_t bytes);
+
+// Shared bump allocator handing out fixed-size blocks to BLists. Thread-safe; spills to malloc when full.
+struct Arena {
+    char* base = nullptr;
+    size_t cap = 0;
+    std::atomic<size_t> used{0};
+    std::atomic<size_t> spilled{0};
+    void init(size_t bytes) {
+        cap = bytes;
+        base = (char*)big_alloc(bytes);
+    }
+    void* take(size_t bytes) {
+        size_t o = used.fetch_add(bytes, std::memory_order_relaxed);
+        if (o + bytes <= cap) return base + o;
+        spilled.fetch_add(1, std::memory_order_relaxed);
+        return malloc(bytes);  // rare; leaked until exit
+    }
+    ~Arena() {
+        if (base) big_free(base, cap);
+    }
+};
+
+// Append-only list of T in 64 KB blocks from an Arena: no reallocation, no copying on growth.
+template <class T>
+struct BList {
+    static constexpr uint32_t B = (1u << 16) / sizeof(T);
+    vector<T*> blocks;
+    T* cur = nullptr;
+    uint32_t last = B;  // count in the last block
+    void push(Arena& A, const T& x) {
+        if (__builtin_expect(last == B, 0)) {
+            cur = (T*)A.take(B * sizeof(T));
+            blocks.push_back(cur);
+            last = 0;
+        }
+        cur[last++] = x;
+    }
+    size_t size() const { return blocks.empty() ? 0 : (blocks.size() - 1) * B + last; }
+    template <class F>
+    void each(F f) const {
+        for (size_t k = 0; k < blocks.size(); k++) {
+            T* p = blocks[k];
+            uint32_t n = k + 1 == blocks.size() ? last : B;
+            for (uint32_t i = 0; i < n; i++) f(p[i]);
+        }
+    }
+    template <class F>
+    void each_block(F f) const {
+        for (size_t k = 0; k < blocks.size(); k++) f(blocks[k], k + 1 == blocks.size() ? last : B);
+    }
+};
+
 struct Chunk {
     const char* b;
     const char* e;
@@ -123,9 +179,15 @@ struct ClickRec {
 };
 static const uint32_t PRICE_MASK = 0xFFFFFF;
 
-// [thread][person partition]
-using EvParts = vector<vector<vector<SessEv>>>;
-using CkParts = vector<vector<vector<ClickRec>>>;
+// [thread][person partition], blocks in `arena`
+struct EvParts {
+    Arena arena;
+    vector<vector<BList<SessEv>>> p;
+};
+struct CkParts {
+    Arena arena;
+    vector<vector<BList<ClickRec>>> p;
+};
 void parse_and_dedup(const Ctx& c, Persons& P, EvParts& sp, CkParts& ckp);
 
 // ---- sessions.cpp

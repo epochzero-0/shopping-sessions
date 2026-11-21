@@ -20,7 +20,7 @@ void sessions(const Ctx& c, EvParts& sp, CkParts& ckp, Agg& out) {
     vector<size_t> psize(NPART, 0);
     for (int q = 0; q < NPART; q++) {
         order[q] = q;
-        for (int t = 0; t < T; t++) psize[q] += sp[t][q].size();
+        for (int t = 0; t < T; t++) psize[q] += sp.p[t][q].size();
     }
     std::sort(order.begin(), order.end(), [&](int a, int b) { return psize[a] > psize[b]; });
     std::atomic<int> next{0};
@@ -40,10 +40,8 @@ void sessions(const Ctx& c, EvParts& sp, CkParts& ckp, Agg& out) {
             evs.clear();
             cks.clear();
             for (int s = 0; s < T; s++) {
-                evs.insert(evs.end(), sp[s][q].begin(), sp[s][q].end());
-                vector<SessEv>().swap(sp[s][q]);
-                cks.insert(cks.end(), ckp[s][q].begin(), ckp[s][q].end());
-                vector<ClickRec>().swap(ckp[s][q]);
+                sp.p[s][q].each_block([&](const SessEv* p, uint32_t n) { evs.insert(evs.end(), p, p + n); });
+                ckp.p[s][q].each_block([&](const ClickRec* p, uint32_t n) { cks.insert(cks.end(), p, p + n); });
             }
             std::sort(evs.begin(), evs.end(), [](const SessEv& a, const SessEv& b) {
                 return a.pid != b.pid ? a.pid < b.pid : a.ts < b.ts;

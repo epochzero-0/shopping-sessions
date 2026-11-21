@@ -7,17 +7,18 @@
 void Persons::init(size_t n) {
     size_t c = 1024;
     while (c < n * 2) c <<= 1;
-    s = (Slot*)calloc(c, sizeof(Slot));
+    s = (Slot*)big_alloc(c * sizeof(Slot));
     mask = c - 1;
     cap = (uint32_t)(c * 7 / 8);
-    name_p = (const char**)malloc(cap * sizeof(const char*));
-    name_l = (uint32_t*)malloc(cap * sizeof(uint32_t));
+    name_p = (const char**)big_alloc(cap * sizeof(const char*));
+    name_l = (uint32_t*)big_alloc(cap * sizeof(uint32_t));
 }
 
 Persons::~Persons() {
-    free(s);
-    free(name_p);
-    free(name_l);
+    if (!s) return;
+    big_free(s, (mask + 1) * sizeof(Slot));
+    big_free(name_p, cap * sizeof(const char*));
+    big_free(name_l, cap * sizeof(uint32_t));
 }
 
 void build_links(const Ctx& c, Persons& P, size_t est_users) {

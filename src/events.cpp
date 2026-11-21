@@ -23,16 +23,18 @@ void parse_and_dedup(const Ctx& c, Persons& P, EvParts& sp, CkParts& ckp) {
     const int T = c.T;
     const int64_t ws = c.ws, we = c.we;
     // events by event_id hash, clicks by person hash
-    vector<vector<vector<EvRec>>> evp(T, vector<vector<EvRec>>(NPART));
-    ckp.assign(T, vector<vector<ClickRec>>(NPART));
+    // Arenas are virtual reservations sized for the shortest possible lines; only touched pages count.
+    const size_t slack = (size_t)T * NPART * (1 << 16);
+    Arena eva;
+    eva.init(c.ev_bytes / 16 * sizeof(EvRec) + slack);
+    ckp.arena.init(c.ck_bytes / 12 * sizeof(ClickRec) + slack);
+    vector<vector<BList<EvRec>>> evp(T, vector<BList<EvRec>>(NPART));
+    ckp.p.assign(T, vector<BList<ClickRec>>(NPART));
     {
-        size_t est_ev = c.ev_bytes / 60 / T / NPART + 16, est_ck = c.ck_bytes / 40 / T / NPART + 16;
         std::atomic<size_t> next{0};
         parallel(T, [&](int t) {
-            for (auto& v : evp[t]) v.reserve(est_ev);
-            for (auto& v : ckp[t]) v.reserve(est_ck);
             auto& ev = evp[t];
-            auto& ck = ckp[t];
+            auto& ck = ckp.p[t];
             for (size_t k; (k = next++) < c.main_chunks.size();) {
                 const Chunk& ch = c.main_chunks[k];
                 if (ch.kind == 0) {
@@ -82,7 +84,7 @@ void parse_and_dedup(const Ctx& c, Persons& P, EvParts& sp, CkParts& ckp) {
                             r.pid = P.get(fp[1], fl[1]);
                             r.flags = 1;
                         }
-                        ev[r.h >> (64 - PBITS)].push_back(r);
+                        ev[r.h >> (64 - PBITS)].push(eva, r);
                     });
                 } else {
                     for_lines(ch.b, ch.e, [&](const char* b, const char* e) {
@@ -99,7 +101,7 @@ void parse_and_dedup(const Ctx& c, Persons& P, EvParts& sp, CkParts& ckp) {
                         r.cid = fp[0];
                         r.cidlen = fl[0];
                         r.camp = (uint32_t)camp;
-                        ck[ppart(r.pid)].push_back(r);
+                        ck[ppart(r.pid)].push(ckp.arena, r);
                     });
                 }
             }
@@ -108,7 +110,8 @@ void parse_and_dedup(const Ctx& c, Persons& P, EvParts& sp, CkParts& ckp) {
     phase("parse events+clicks");
 
     // dedup events per partition, emit survivors by person partition
-    sp.assign(T, vector<vector<SessEv>>(NPART));
+    sp.arena.init(c.ev_bytes / 16 * sizeof(SessEv) + slack);
+    sp.p.assign(T, vector<BList<SessEv>>(NPART));
     vector<int> order(NPART);
     vector<size_t> psize(NPART, 0);
     for (int q = 0; q < NPART; q++) {
@@ -116,11 +119,9 @@ void parse_and_dedup(const Ctx& c, Persons& P, EvParts& sp, CkParts& ckp) {
         for (int t = 0; t < T; t++) psize[q] += evp[t][q].size();
     }
     std::sort(order.begin(), order.end(), [&](int a, int b) { return psize[a] > psize[b]; });
-    size_t total = 0;
-    for (auto s : psize) total += s;
     std::atomic<int> next{0};
     parallel(T, [&](int t) {
-        for (auto& v : sp[t]) v.reserve(total / T / NPART + 16);
+        auto& out = sp.p[t];
         vector<EvRec*> table;
         for (int k; (k = next++) < NPART;) {
             int q = order[k];
@@ -129,7 +130,7 @@ void parse_and_dedup(const Ctx& c, Persons& P, EvParts& sp, CkParts& ckp) {
             table.assign(cap, nullptr);
             size_t mask = cap - 1;
             for (int s = 0; s < T; s++)
-                for (auto& r : evp[s][q]) {
+                evp[s][q].each([&](EvRec& r) {
                     size_t i = (r.h * 0x9E3779B97F4A7C15ull >> 20) & mask;
                     while (true) {
                         EvRec* x = table[i];
@@ -143,13 +144,11 @@ void parse_and_dedup(const Ctx& c, Persons& P, EvParts& sp, CkParts& ckp) {
                         }
                         i = (i + 1) & mask;
                     }
-                }
+                });
             for (EvRec* x : table) {
                 if (!x || !(x->flags & 1)) continue;
-                SessEv e;
-                sp[t][ppart(x->pid)].push_back({x->ts, x->pid, x->pc});
+                out[ppart(x->pid)].push(sp.arena, {x->ts, x->pid, x->pc});
             }
-            for (int s = 0; s < T; s++) vector<EvRec>().swap(evp[s][q]);
         }
     });
     phase("dedup");
