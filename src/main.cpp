@@ -348,7 +348,7 @@ static void run_once(const string& data, const string& outdir, int T) {
     CkParts ckp;
     parse_and_dedup(c, P, sp, ckp);
     Agg A;
-    sessions(c, sp, ckp, A);
+    sessions(c, P.next.load(), sp, ckp, A);
     phase("sessions");
     write_outputs(c, P, A, outdir);
     phase("write");

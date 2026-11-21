@@ -202,4 +202,5 @@ struct Agg {
     vector<vector<URow>> urows;                          // [thread]
     vector<vector<int64_t>> c_sess, c_purch, c_rev, c_assist;  // [thread][campaign * ndays + day]
 };
-void sessions(const Ctx& c, EvParts& sp, CkParts& ckp, Agg& out);
+// npid: number of person ids handed out (Persons::next)
+void sessions(const Ctx& c, uint32_t npid, EvParts& sp, CkParts& ckp, Agg& out);
