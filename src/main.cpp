@@ -237,38 +237,46 @@ static void write_outputs(const Ctx& c, const Links& L, Agg& A, const string& ou
         vector<Col> cols = {Col{"user_id", P_BYTES, false, 0, 1, {}}, Col{"day", P_INT32, false, 6, 6, {}},
                             col_i64("sessions"), col_i64("events"), col_i64("revenue_cents"),
                             Col{"top_category", P_BYTES, true, 0, 1, {}}};
-        size_t n = rows.size();
-        cols[0].data.reserve(n * 14);
-        cols[1].data.reserve(n * 4);
-        for (int k = 2; k < 5; k++) cols[k].data.reserve(n * 8);
-        string defs((n + 7) / 8, '\0');
-        string vals;
-        for (size_t k = 0; k < n; k++) {
-            auto& r = rows[k];
-            char buf[16];
-            uint32_t nl;
-            const char* name = L.name(r.key, buf, nl);
-            bytes_val(cols[0].data, name, nl);
-            put32(cols[1].data, (uint32_t)r.day);
-            put64(cols[2].data, r.sessions);
-            put64(cols[3].data, r.events);
-            put64(cols[4].data, r.revenue);
-            if (r.topcat >= 0) {
-                defs[k >> 3] |= (char)(1 << (k & 7));
-                bytes_val(vals, c.catnames[r.topcat].data(), (uint32_t)c.catnames[r.topcat].size());
-            }
-        }
-        string rle;
-        {
-            uint64_t hdr = ((uint64_t)((n + 7) / 8) << 1) | 1;
-            while (hdr >= 0x80) rle.push_back((char)((hdr & 0x7f) | 0x80)), hdr >>= 7;
-            rle.push_back((char)hdr);
-            rle += defs;
-        }
+        const size_t n = rows.size();
         if (n) {
-            put32(cols[5].data, (uint32_t)rle.size());
-            cols[5].data += rle;
-            cols[5].data += vals;
+            // every column dictionary-encoded; a person's rows are adjacent, so user_id indices are runs
+            vector<uint32_t> ix(n), tix;
+            string names;
+            uint32_t nnames = 0;
+            uint64_t prev = 0;
+            for (size_t k = 0; k < n; k++) {
+                if (k == 0 || rows[k].key != prev) {
+                    prev = rows[k].key;
+                    char buf[16];
+                    uint32_t nl;
+                    const char* name = L.name(prev, buf, nl);
+                    bytes_val(names, name, nl);
+                    nnames++;
+                }
+                ix[k] = nnames - 1;
+            }
+            set_dict(cols[0], std::move(names), nnames, ix);
+            {
+                IntDict d(4);
+                for (size_t k = 0; k < n; k++) ix[k] = d.get(rows[k].day);
+                set_dict(cols[1], std::move(d.dict), d.n, ix);
+            }
+            for (int col = 2; col < 5; col++) {
+                IntDict d(8);
+                for (size_t k = 0; k < n; k++)
+                    ix[k] = d.get(col == 2 ? rows[k].sessions : col == 3 ? rows[k].events : rows[k].revenue);
+                set_dict(cols[col], std::move(d.dict), d.n, ix);
+            }
+            vector<uint32_t> defs(n);
+            for (size_t k = 0; k < n; k++)
+                if ((defs[k] = rows[k].topcat >= 0)) tix.push_back((uint32_t)rows[k].topcat);
+            string lev;
+            rle_hybrid(lev, defs.data(), n, 1);
+            put32(cols[5].data, (uint32_t)lev.size());
+            cols[5].data += lev;
+            string cats;
+            for (auto& s : c.catnames) bytes_val(cats, s.data(), (uint32_t)s.size());
+            set_dict(cols[5], std::move(cats), (uint32_t)c.catnames.size(), tix);
         }
         write_parquet(outdir + "/user_daily/part-" + std::to_string(t) + ".parquet", cols, (int64_t)n);
     });

@@ -1,4 +1,5 @@
-// Minimal Parquet writer: PLAIN, uncompressed, one row group, one page per column.
+// Minimal Parquet writer: uncompressed, one row group, one data page per column, PLAIN or dictionary
+// (PLAIN dictionary page + RLE_DICTIONARY data page).
 #pragma once
 #include <cstdint>
 #include <cstdio>
@@ -55,10 +56,114 @@ struct Col {
     int conv;     // -1 none, 0 UTF8, 6 DATE
     int logical;  // 0 none, 1 STRING, 6 DATE
     std::string data;  // page body
+    std::string dict;  // PLAIN dictionary page body; used when ndict > 0, and then `data` holds the indices
+    int32_t ndict = 0;
 };
 
 static inline void put32(std::string& s, uint32_t v) { s.append((const char*)&v, 4); }
 static inline void put64(std::string& s, uint64_t v) { s.append((const char*)&v, 8); }
+
+static inline void put_varint(std::string& s, uint64_t v) {
+    while (v >= 0x80) s.push_back((char)((v & 0x7f) | 0x80)), v >>= 7;
+    s.push_back((char)v);
+}
+
+// Bits for dictionary indices 0..n-1 (at least 1).
+static inline int index_width(uint32_t n) {
+    int b = 1;
+    while (b < 32 && (1u << b) < n) b++;
+    return b;
+}
+
+// RLE / bit-packed hybrid of v[0..n) at bw bits: runs of >= 8 equal values as RLE, the rest in bit-packed groups
+// of 8 (at most 63 per run, zero-padded at the end).
+static void rle_hybrid(std::string& s, const uint32_t* v, size_t n, int bw) {
+    const int vb = (bw + 7) / 8;
+    size_t i = 0;
+    while (i < n) {
+        size_t r = i + 1;
+        while (r < n && v[r] == v[i]) r++;
+        if (r - i >= 8) {
+            put_varint(s, (uint64_t)(r - i) << 1);
+            for (int k = 0; k < vb; k++) s.push_back((char)(v[i] >> (8 * k)));
+            i = r;
+            continue;
+        }
+        const size_t hdr = s.size();
+        s.push_back(0);
+        uint32_t g = 0;
+        for (;;) {
+            uint64_t acc = 0;
+            int nb = 0;
+            for (int k = 0; k < 8; k++) {
+                acc |= (uint64_t)(i + k < n ? v[i + k] : 0) << nb;
+                for (nb += bw; nb >= 8; nb -= 8) s.push_back((char)acc), acc >>= 8;
+            }
+            i += 8, g++;
+            if (i >= n || g == 63) break;
+            size_t r2 = i + 1;
+            while (r2 < n && r2 - i < 8 && v[r2] == v[i]) r2++;
+            if (r2 - i >= 8) break;
+        }
+        s[hdr] = (char)((g << 1) | 1);
+    }
+}
+
+// Integer value -> dictionary index, dictionary page body built in first-seen order (vb bytes per value).
+struct IntDict {
+    std::vector<int64_t> k;
+    std::vector<uint32_t> v;  // index + 1, 0 empty
+    std::string dict;
+    uint32_t n = 0;
+    size_t mask = 0;
+    int vb;
+    explicit IntDict(int bytes) : vb(bytes) { init(1024); }
+    void init(size_t cap) {
+        k.assign(cap, 0);
+        v.assign(cap, 0);
+        mask = cap - 1;
+    }
+    static size_t slot(int64_t x, size_t mask) {
+        const uint64_t h = (uint64_t)x * 0x9E3779B97F4A7C15ull;
+        return (size_t)(h ^ (h >> 32)) & mask;
+    }
+    uint32_t get(int64_t x) {
+        for (size_t i = slot(x, mask);; i = (i + 1) & mask) {
+            if (!v[i]) {
+                if ((size_t)(n + 1) * 2 > mask + 1) {
+                    grow();
+                    return get(x);
+                }
+                k[i] = x, v[i] = ++n;
+                dict.append((const char*)&x, vb);
+                return n - 1;
+            }
+            if (k[i] == x) return v[i] - 1;
+        }
+    }
+    void grow() {
+        std::vector<int64_t> ok;
+        std::vector<uint32_t> ov;
+        ok.swap(k), ov.swap(v);
+        init((mask + 1) * 2);
+        for (size_t i = 0; i < ok.size(); i++)
+            if (ov[i])
+                for (size_t j = slot(ok[i], mask);; j = (j + 1) & mask)
+                    if (!v[j]) {
+                        k[j] = ok[i], v[j] = ov[i];
+                        break;
+                    }
+    }
+};
+
+// Fill a dictionary column from its indices; `data` may already hold the definition levels.
+static inline void set_dict(Col& c,std::string&& dict, uint32_t ndict, const std::vector<uint32_t>& idx) {
+    c.dict = std::move(dict);
+    c.ndict = (int32_t)ndict;
+    const int bw = index_width(ndict);
+    c.data.push_back((char)bw);
+    rle_hybrid(c.data, idx.data(), idx.size(), bw);
+}
 
 static inline void bytes_val(std::string& s, const char* p, uint32_t n) {
     put32(s, n);
@@ -69,15 +174,31 @@ static inline Col col_i64(const std::string& name) { return Col{name, P_INT64, f
 
 static void write_parquet(const std::string& path, std::vector<Col>& cols, int64_t nrows) {
     std::string out = "PAR1";
-    std::vector<int64_t> offs, sizes;
+    std::vector<int64_t> offs, dict_offs, sizes;
     for (auto& c : cols) {
+        const size_t begin = out.size();
+        dict_offs.push_back((int64_t)begin);
+        if (c.ndict) {
+            Thrift dh;
+            dh.i32(1, 2);  // DICTIONARY_PAGE
+            dh.i32(2, (int32_t)c.dict.size());
+            dh.i32(3, (int32_t)c.dict.size());
+            dh.open(7);
+            dh.i32(1, c.ndict);
+            dh.i32(2, 0);  // PLAIN
+            dh.close();
+            dh.byte(0);
+            out += dh.b;
+            out += c.dict;
+            std::string().swap(c.dict);
+        }
         Thrift ph;
         ph.i32(1, 0);
         ph.i32(2, (int32_t)c.data.size());
         ph.i32(3, (int32_t)c.data.size());
         ph.open(5);
         ph.i32(1, (int32_t)nrows);
-        ph.i32(2, 0);
+        ph.i32(2, c.ndict ? 8 : 0);  // RLE_DICTIONARY or PLAIN
         ph.i32(3, 3);
         ph.i32(4, 3);
         ph.close();
@@ -85,7 +206,7 @@ static void write_parquet(const std::string& path, std::vector<Col>& cols, int64
         offs.push_back(out.size());
         out += ph.b;
         out += c.data;
-        sizes.push_back(ph.b.size() + c.data.size());
+        sizes.push_back((int64_t)(out.size() - begin));
         std::string().swap(c.data);
     }
     Thrift m;
@@ -118,12 +239,19 @@ static void write_parquet(const std::string& path, std::vector<Col>& cols, int64
         m.lst(1, 12, (int)cols.size());
         for (size_t i = 0; i < cols.size(); i++) {
             m.push();
-            m.i64(2, offs[i]);
+            m.i64(2, dict_offs[i]);
             m.open(3);
             m.i32(1, cols[i].ptype);
-            m.lst(2, 5, 2);
-            m.zz(0);
-            m.zz(3);
+            if (cols[i].ndict) {
+                m.lst(2, 5, 3);
+                m.zz(0);
+                m.zz(3);
+                m.zz(8);
+            } else {
+                m.lst(2, 5, 2);
+                m.zz(0);
+                m.zz(3);
+            }
             m.lst(3, 8, 1);
             m.varint(cols[i].name.size());
             m.b += cols[i].name;
@@ -132,6 +260,7 @@ static void write_parquet(const std::string& path, std::vector<Col>& cols, int64
             m.i64(6, sizes[i]);
             m.i64(7, sizes[i]);
             m.i64(9, offs[i]);
+            if (cols[i].ndict) m.i64(11, dict_offs[i]);
             m.close();
             m.close();
         }
