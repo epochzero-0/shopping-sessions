@@ -1,0 +1,14 @@
+upstream/
+STARTER.md
+TRACK.md
+dev/
+big/
+s[0-9]*/
+out/
+out*/
+data*/
+target/
+build/
+*.o
+*.exe
+__pycache__/
