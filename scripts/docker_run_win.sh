@@ -20,5 +20,5 @@ MSYS_NO_PATHCONV=1 docker run --rm --platform linux/amd64 \
   --user 1000:1000 \
   -v "$DATA":/data:ro -v "$OUT":/output -v "$SCRATCH_W":/scratch \
   -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch \
-  -e NCPU="${CPUS%.*}" -e MEM_GB="${MEM%g}" \
+  -e NCPU="${CPUS%.*}" -e MEM_GB="${MEM%g}" -e BENCH="${BENCH:-1}" \
   "$IMAGE"
