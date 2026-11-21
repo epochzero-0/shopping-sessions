@@ -57,10 +57,8 @@ void build_links(const Ctx& c, Persons& P, size_t est_users) {
             auto& out = edges[t];
             out.reserve(lines * 2 / T + 1024);
             for (size_t k; (k = next++) < NK;) {
-                for_lines(c.link_chunks[k].b, c.link_chunks[k].e, [&](const char* b, const char* e) {
-                    const char* fp[2];
-                    uint32_t fl[2];
-                    if (!split<2>(b, e, fp, fl) || !fl[0] || !fl[1]) return;
+                scan_lines<2>(c.link_chunks[k].b, c.link_chunks[k].e, [&](const char* const* fp, const uint32_t* fl) {
+                    if (!fl[0] || !fl[1]) return;
                     for (int j = 0; j < 2; j++) {
                         size_t slot;
                         uint32_t id = P.get(fp[j], fl[j], &slot);

@@ -1,4 +1,5 @@
-// split(), for_lines(), parse_ts() vs ref/reference.py on the cases from tests/csv_cases.py.
+// split(), for_lines(), parse_ts() vs ref/reference.py on the cases from tests/csv_cases.py;
+// scan_lines() vs the reference on every split case and vs for_lines + split on every blob.
 // Each input sits in an exact-size heap buffer, so ASan flags any read past its end.
 // Usage: csv_test CASES   Prints "unit PASSED/TOTAL"; exit 1 on any mismatch.
 #include <cstdio>
@@ -44,11 +45,46 @@ static std::string run_split(const Buf& b) {
     return r;
 }
 
+template <int N>
+static std::string fields(const char* const* fp, const uint32_t* fl) {
+    std::string r = "ok";
+    for (int i = 0; i < N; i++) r += " " + (fl[i] ? hex(fp[i], fl[i]) : std::string("-"));
+    return r;
+}
+
+// scan_lines<N> on a single line: same answer format as run_split
+template <int N>
+static std::string run_scan(const Buf& b) {
+    std::string r = "bad";
+    int calls = 0;
+    scan_lines<N>(b.p, b.p + b.n, [&](const char* const* fp, const uint32_t* fl) {
+        r = fields<N>(fp, fl);
+        calls++;
+    });
+    return calls > 1 ? "multi" : r;
+}
+
+// scan_lines<N> over a blob vs for_lines + split<N>
+template <int N>
+static std::string scan_blob(const Buf& b, bool use_scan) {
+    std::string r;
+    if (use_scan) {
+        scan_lines<N>(b.p, b.p + b.n, [&](const char* const* fp, const uint32_t* fl) { r += fields<N>(fp, fl) + "|"; });
+    } else {
+        for_lines(b.p, b.p + b.n, [&](const char* s, const char* e) {
+            const char* fp[N];
+            uint32_t fl[N];
+            if (split<N>(s, e, fp, fl)) r += fields<N>(fp, fl) + "|";
+        });
+    }
+    return r;
+}
+
 int main(int argc, char** argv) {
     std::ifstream in(argc > 1 ? argv[1] : "build/csv_cases.txt");
     if (!in) { fprintf(stderr, "no cases file\n"); return 2; }
     std::string line;
-    long total = 0, bad = 0;
+    long total = 0, bad = 0, scan_total = 0, scan_bad = 0;
     while (std::getline(in, line)) {
         std::istringstream ss(line);
         std::string kind, got, want;
@@ -61,6 +97,9 @@ int main(int argc, char** argv) {
             want = want.substr(1);
             Buf b(unhex(x));
             got = n == 2 ? run_split<2>(b) : n == 4 ? run_split<4>(b) : run_split<7>(b);
+            std::string sc = n == 2 ? run_scan<2>(b) : n == 4 ? run_scan<4>(b) : run_scan<7>(b);
+            scan_total++;
+            if (sc != want && ++scan_bad <= 10) fprintf(stderr, "SCAN MISMATCH %s\n  got  %s\n", line.c_str(), sc.c_str());
         } else if (kind == "T") {
             std::string x;
             ss >> x;
@@ -79,6 +118,10 @@ int main(int argc, char** argv) {
             for_lines(b.p, b.p + b.n, [&](const char* s, const char* e) { ls.push_back(hex(s, e - s)); });
             got = std::to_string(ls.size()) + " ";
             for (size_t i = 0; i < ls.size(); i++) got += (i ? " " : "") + ls[i];
+            bool ok = scan_blob<2>(b, true) == scan_blob<2>(b, false) && scan_blob<4>(b, true) == scan_blob<4>(b, false) &&
+                      scan_blob<7>(b, true) == scan_blob<7>(b, false);
+            scan_total++;
+            if (!ok && ++scan_bad <= 10) fprintf(stderr, "SCAN BLOB MISMATCH %s\n", x.substr(0, 200).c_str());
         } else {
             continue;
         }
@@ -87,6 +130,6 @@ int main(int argc, char** argv) {
             if (++bad <= 10) fprintf(stderr, "MISMATCH %s\n  got  %s\n", line.c_str(), got.c_str());
         }
     }
-    printf("unit %ld/%ld\n", total - bad, total);
-    return bad ? 1 : 0;
+    printf("unit %ld/%ld scan %ld/%ld\n", total - bad, total, scan_total - scan_bad, scan_total);
+    return bad || scan_bad ? 1 : 0;
 }

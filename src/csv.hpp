@@ -2,6 +2,9 @@
 #pragma once
 #include <cstdint>
 #include <cstring>
+#ifdef __AVX512BW__
+#include <immintrin.h>
+#endif
 
 // Iterate lines of a chunk; a trailing '\n' ends a line, it does not start an empty one.
 template <class F>
@@ -39,6 +42,85 @@ static inline bool split(const char* p, const char* e, const char** fp, uint32_t
         p = c + 1;
     }
     return true;
+}
+
+// for_lines + split<N> in one pass: f(fp, fl) for every line that splits into exactly N fields.
+// AVX-512BW: a line is read as a 128-byte window (two zmm); ',', '"', '\n' become bitmasks, fields are walked
+// with tzcnt. Quote rule on masks: every quote sits at a field's first or last byte, quotes pair up with no ','
+// between a pair (prefix XOR), even count. Lines over 127 bytes take memchr + split.
+template <int N, class F>
+static inline void scan_lines(const char* p, const char* e, F f) {
+    const char* fp[N];
+    uint32_t fl[N];
+#ifdef __AVX512BW__
+    const __m512i vc = _mm512_set1_epi8(','), vq = _mm512_set1_epi8('"'), vn = _mm512_set1_epi8('\n');
+    while (p < e) {
+        const size_t rem = (size_t)(e - p);
+        __m512i a, b;
+        if (rem >= 128) {
+            a = _mm512_loadu_si512(p);
+            b = _mm512_loadu_si512(p + 64);
+        } else {  // masked loads: bytes past e are zero and never touched
+            a = _mm512_maskz_loadu_epi8(_bzhi_u64(~0ull, (unsigned)rem), p);
+            b = _mm512_maskz_loadu_epi8(rem > 64 ? _bzhi_u64(~0ull, (unsigned)(rem - 64)) : 0, p + 64);
+        }
+        const uint64_t n0 = _mm512_cmpeq_epi8_mask(a, vn), n1 = _mm512_cmpeq_epi8_mask(b, vn);
+        uint32_t L = (uint32_t)_tzcnt_u64(n0) + (n0 ? 0 : (uint32_t)_tzcnt_u64(n1));  // tzcnt(0) = 64
+        if (__builtin_expect((n0 | n1) == 0, 0)) {
+            if (rem <= 128) {
+                L = (uint32_t)rem;
+            } else {  // long line
+                const char* nl = (const char*)memchr(p, '\n', rem);
+                const char* le = nl ? nl : e;
+                if (split<N>(p, le, fp, fl)) f(fp, fl);
+                p = le + 1;
+                continue;
+            }
+        }
+        const uint64_t lm0 = _bzhi_u64(~0ull, L), lm1 = L > 64 ? _bzhi_u64(~0ull, L - 64) : 0;
+        const uint64_t c0 = _mm512_cmpeq_epi8_mask(a, vc) & lm0, c1 = _mm512_cmpeq_epi8_mask(b, vc) & lm1;
+        const char* line = p;
+        p += L + 1;
+        if (_mm_popcnt_u64(c0) + _mm_popcnt_u64(c1) != N - 1) continue;
+        const uint64_t q0 = _mm512_cmpeq_epi8_mask(a, vq) & lm0, q1 = _mm512_cmpeq_epi8_mask(b, vq) & lm1;
+        // Branch-free: most lines have a quoted field, but which ones is random.
+        // Field first bytes (after ',' or line start) and last bytes (before ',' or line end); L >= 1 here.
+        const uint64_t s0 = c0 << 1 | 1, s1 = c1 << 1 | c0 >> 63;
+        const uint64_t e0 = c0 >> 1 | c1 << 63 | _bzhi_u64(1ull << ((L - 1) & 63), L <= 64 ? 64 : 0);
+        const uint64_t e1 = c1 >> 1 | _bzhi_u64(1ull << ((L - 1) & 63), L > 64 ? 64 : 0);
+        const __m128i ones = _mm_set1_epi64x(-1);
+        const uint64_t x0 = (uint64_t)_mm_cvtsi128_si64(_mm_clmulepi64_si128(_mm_cvtsi64_si128((long long)q0), ones, 0));
+        const uint64_t x1 = (uint64_t)_mm_cvtsi128_si64(_mm_clmulepi64_si128(_mm_cvtsi64_si128((long long)q1), ones, 0)) ^
+                            (0 - (uint64_t)(_mm_popcnt_u64(q0) & 1));
+        const uint64_t bad = (q0 & ~(s0 | e0)) | (q1 & ~(s1 | e1)) | (x0 & c0) | (x1 & c1) |
+                             x1 >> 63;  // last bit of the prefix XOR = odd quote count
+        if (bad) continue;
+        // Exactly N-1 commas: take the next from c0, else c1 (cmov, fixed trip count).
+        uint64_t m0 = c0, m1 = c1;
+        uint32_t s = 0;
+        for (int k = 0; k < N; k++) {
+            uint32_t end;
+            if (k == N - 1) {
+                end = L;
+            } else {
+                const bool lo = m0 != 0;
+                end = lo ? (uint32_t)_tzcnt_u64(m0) : 64 + (uint32_t)_tzcnt_u64(m1);
+                m1 = lo ? m1 : _blsr_u64(m1);
+                m0 = _blsr_u64(m0);
+            }
+            // a quote at a field's first byte: quoted field (from the mask: line[s] may be past e)
+            const uint32_t qt = (uint32_t)((s < 64 ? q0 : q1) >> (s & 63) & 1) & (end > s);
+            fp[k] = line + s + qt;
+            fl[k] = end - s - 2 * qt;
+            s = end + 1;
+        }
+        f(fp, fl);
+    }
+#else
+    for_lines(p, e, [&](const char* b, const char* le) {
+        if (split<N>(b, le, fp, fl)) f(fp, fl);
+    });
+#endif
 }
 
 static inline int64_t days_from_civil(int64_t y, unsigned m, unsigned d) {

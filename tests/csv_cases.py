@@ -76,6 +76,26 @@ for _ in range(30000):
         ln = b"".join(rng.choice(ALPHA) for _ in range(rng.randrange(0, 25)))
     lines.append((k, ln))
 
+
+def long_line():
+    """0-200 bytes, so lines straddle scan_lines' 64- and 128-byte window edges."""
+    k = rng.choice((2, 4, 7))
+    target = rng.randrange(0, 200)
+    fields = []
+    for i in range(k):
+        n = max(0, (target // k) + rng.randrange(-8, 9))
+        v = bytes(rng.choice(b"ab1 \r\t") for _ in range(n))
+        fields.append(b'"' + v + b'"' if rng.random() < 0.4 else v)
+    ln = bytearray(b",".join(fields))
+    for _ in range(rng.randrange(0, 3)):
+        if ln:
+            ln[rng.randrange(len(ln))] = rng.choice(b'",\r a')
+    return k, bytes(ln)
+
+
+LONG = [long_line() for _ in range(20000)]
+lines.extend(LONG)
+
 # ---------------------------------------------------------------- timestamps
 
 ts = set()
@@ -111,6 +131,9 @@ for b in (b"", b"\n", b"\n\n", b"a", b"a\n", b"a\nb", b"a\n\nb\n", b"a\r\nb\r\n"
     blobs.append(b)
 for _ in range(3000):
     blobs.append(bytes(rng.choice(b"ab\n\n\r,") for _ in range(rng.randrange(0, 30))))
+for _ in range(2000):  # many window-crossing lines per blob, with or without a final '\n'
+    blob = b"\n".join(ln for _, ln in rng.sample(LONG, rng.randrange(1, 12)))
+    blobs.append(blob + b"\n" if rng.random() < 0.5 else blob)
 
 with open(sys.argv[1], "w", newline="\n") as out:
     for k, ln in lines:

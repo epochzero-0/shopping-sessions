@@ -38,10 +38,8 @@ void parse_and_dedup(const Ctx& c, Persons& P, EvParts& sp, CkParts& ckp) {
             for (size_t k; (k = next++) < c.main_chunks.size();) {
                 const Chunk& ch = c.main_chunks[k];
                 if (ch.kind == 0) {
-                    for_lines(ch.b, ch.e, [&](const char* b, const char* e) {
-                        const char* fp[7];
-                        uint32_t fl[7];
-                        if (!split<7>(b, e, fp, fl) || !fl[0]) return;
+                    scan_lines<7>(ch.b, ch.e, [&](const char* const* fp, const uint32_t* fl) {
+                        if (!fl[0]) return;
                         EvRec r;
                         r.h = hash_bytes(fp[0], fl[0]);
                         r.h2 = hash2(fp[0], fl[0]);
@@ -87,10 +85,8 @@ void parse_and_dedup(const Ctx& c, Persons& P, EvParts& sp, CkParts& ckp) {
                         ev[r.h >> (64 - PBITS)].push(eva, r);
                     });
                 } else {
-                    for_lines(ch.b, ch.e, [&](const char* b, const char* e) {
-                        const char* fp[4];
-                        uint32_t fl[4];
-                        if (!split<4>(b, e, fp, fl) || !fl[0] || !fl[1]) return;
+                    scan_lines<4>(ch.b, ch.e, [&](const char* const* fp, const uint32_t* fl) {
+                        if (!fl[0] || !fl[1]) return;
                         int64_t camp = c.campmap.find(hash_bytes(fp[2], fl[2]), fp[2], fl[2]);
                         if (camp < 0) return;
                         int64_t ts;

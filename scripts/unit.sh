@@ -6,5 +6,5 @@ cd "$(dirname "$0")/.."
 mkdir -p build
 python tests/csv_cases.py build/csv_cases.txt || exit 1
 MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W)":/w:ro gcc:14-bookworm sh -c '
-  g++ -O1 -g -std=c++17 -march=x86-64-v3 -fsanitize=address,undefined -fno-sanitize-recover=all \
+  g++ -O1 -g -std=c++17 -march=cascadelake -fsanitize=address,undefined -fno-sanitize-recover=all \
     -o /tmp/t /w/tests/csv_test.cpp && /tmp/t /w/build/csv_cases.txt'
