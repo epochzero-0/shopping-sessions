@@ -171,13 +171,14 @@ struct Ctx {
 };
 
 // ---- links.cpp
-// User keys: pack_id(ID) when the ID is in that form, else FBIT | its number in FTab (exact compare). Rare in practice
-// (upper-cased IDs), so FTab is a lazily touched reservation.
+// User keys: pack_id(ID) when the ID is in that form, else FBIT | its number in FTab, where an ID is identified by 96
+// bits of hash (hash_bytes, hash2) as event IDs are, so a lookup never reads the stored bytes. FTab is a lazily
+// touched reservation.
 struct FTab {
     struct Slot {
         std::atomic<uint64_t> h;
         std::atomic<uint32_t> id1;  // id + 1, 0 while the inserting thread is still writing
-        uint32_t pad;
+        std::atomic<uint32_t> h2;   // written before id1
     };
     Slot* s = nullptr;
     size_t mask = 0;
@@ -190,6 +191,7 @@ struct FTab {
     uint32_t get(const char* p, uint32_t n) {
         uint64_t h = hash_bytes(p, n);
         if (!h) h = 1;
+        const uint32_t h2 = hash2(p, n);
         for (size_t i = h & mask;; i = (i + 1) & mask) {
             uint64_t cur = s[i].h.load(std::memory_order_relaxed);
             if (cur == 0 && s[i].h.compare_exchange_strong(cur, h, std::memory_order_relaxed)) {
@@ -197,6 +199,7 @@ struct FTab {
                 if (id >= cap) { fprintf(stderr, "fallback table full\n"); abort(); }
                 name_p[id] = p;
                 name_l[id] = n;
+                s[i].h2.store(h2, std::memory_order_relaxed);
                 s[i].id1.store(id + 1, std::memory_order_release);
                 return id;
             }
@@ -204,7 +207,7 @@ struct FTab {
                 uint32_t id1;
                 while (!(id1 = s[i].id1.load(std::memory_order_acquire))) {
                 }
-                if (same(name_p[id1 - 1], name_l[id1 - 1], p, n)) return id1 - 1;
+                if (s[i].h2.load(std::memory_order_relaxed) == h2) return id1 - 1;
             }
         }
     }

@@ -1,5 +1,6 @@
 #!/bin/sh
 # Correctness net: 20 small generated datasets (seed:events) vs ref/reference.py and the Docker image.
+# GEN=generator_v2 uses upstream/generator_v2 (IDs with 32-char hex suffixes); datasets cached per generator.
 # Prints failing seed names, then one line:  seeds 20/20   (exit 1 if any fail)
 # Datasets are cached in build/seeds/data/; oracle + image always rerun. Logs: build/seeds/*.log
 set -u
@@ -13,13 +14,13 @@ CASES="11:1000 12:1000 13:1000 14:1000 15:1000 16:3000 17:5000 18:10000 19:10000
 gen() { # gen SEED EVENTS DIR
   rm -rf "$3.tmp"; mkdir -p "$3.tmp"
   MSYS_NO_PATHCONV=1 docker run --rm -v "$REPO":/repo -w /repo rust:1.85 \
-    upstream/generator/target/release/generate --seed "$1" --events "$2" --clicks $(($2 / 4)) \
+    "upstream/${GEN:-generator}/target/release/generate" --seed "$1" --events "$2" --clicks $(($2 / 4)) \
     --output "/repo/$3.tmp" >"$B/$4.gen.log" 2>&1 && { mv "$3.tmp" "$3" 2>/dev/null || { sleep 2; mv "$3.tmp" "$3"; }; }
 }
 
 FAILED=""; PASS=0; TOTAL=0
 for c in $CASES; do
-  s=${c%%:*}; n=${c#*:}; name="s${s}_${n}"
+  s=${c%%:*}; n=${c#*:}; name="${GEN:+${GEN#generator}_}s${s}_${n}"
   TOTAL=$((TOTAL + 1))
   D="$B/data/$name"
   if [ ! -f "$D/manifest.json" ]; then

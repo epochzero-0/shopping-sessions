@@ -48,28 +48,33 @@ void build_links(const Ctx& c, Links& L, size_t est_users) {
     const int T = c.T;
     const size_t NK = c.link_chunks.size();
     // lines bound the link count; size the tables before interning
-    vector<size_t> klines(NK);
+    vector<size_t> klines(NK), klong(NK);
     {
         std::atomic<size_t> next{0};
         parallel(T, [&](int) {
             for (size_t k; (k = next++) < NK;) {
                 const char* b = c.link_chunks[k].b;
                 const char* e = c.link_chunks[k].e;
-                size_t n = 0;
+                size_t n = 0, nlong = 0;
                 while (b < e) {
                     const char* nl = (const char*)memchr(b, '\n', e - b);
                     n++;
+                    nlong += (nl ? nl : e) - b > 25;  // two packable IDs, quoted, a comma: at most 25 bytes
                     if (!nl) break;
                     b = nl + 1;
                 }
                 klines[k] = n;
+                klong[k] = nlong;
             }
         });
     }
-    size_t lines = 0;
-    for (size_t n : klines) lines += n;
+    size_t lines = 0, longl = 0;
+    for (size_t k = 0; k < NK; k++) lines += klines[k], longl += klong[k];
     const size_t maxnodes = 2 * lines + 16;
-    L.F.init(maxnodes + est_users);
+    // FTab holds IDs that do not pack: link sides on long lines, short ones that are not [0-9a-z] (upper-cased, rare),
+    // and row IDs: about half the share of link lines with a long side (a line has two), taken whole plus 1/32.
+    const double share = std::min(1.0, (double)longl / (lines ? lines : 1) + 1.0 / 32);
+    L.F.init(std::min(maxnodes, 2 * longl + lines / 16 + 1024) + (size_t)(est_users * share));
     L.init(maxnodes);
     // node id -> key, ID bytes, slot; written by the inserting thread. Each thread takes ids in blocks of IDBLK, so
     // threads share neither the counter nor cache lines of these arrays; ids never handed out keep nkey 0 (a hole).
