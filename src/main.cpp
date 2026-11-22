@@ -246,7 +246,25 @@ static void load_small(const string& data, Ctx& c) {
 static void write_campaign(const Ctx& c, Agg& A, const string& outdir);
 
 // Thread t's user_daily rows go to part-t; one more thread writes campaign_daily alongside.
-static void write_outputs(const Ctx& c, const Links& L, Agg& A, const string& outdir) {
+// Persons keyed by a hashed user ID are unlinked, so their name is that ID: any valid event row of theirs points at it.
+static void resolve_names(int T, Links& L, const EvParts& sp, const Agg& A) {
+    size_t n = 0;
+    for (auto& rows : A.urows)
+        for (size_t k = 0; k < rows.size(); k++) n += hashed_key(rows[k].key) && (!k || rows[k].key != rows[k - 1].key);
+    if (!n) return;
+    L.H.init(n);
+    for (auto& rows : A.urows)
+        for (auto& r : rows)
+            if (hashed_key(r.key)) L.H.add(r.key);
+    parallel(T, [&](int t) {
+        sp.names[t].each([&](const NameRec& r) {
+            HNames::Slot* s = L.H.find(r.key);
+            if (s && !s->p.load(std::memory_order_relaxed)) s->p.store(r.p, std::memory_order_relaxed);
+        });
+    });
+}
+
+static void write_outputs(const Ctx& c, Links& L, Agg& A, const string& outdir) {
     const int T = c.T;
     fs::create_directories(outdir + "/user_daily");
     fs::create_directories(outdir + "/campaign_daily");
@@ -411,13 +429,14 @@ static void run_once(const string& data, const string& outdir, int T) {
     c.T = T;
     load_small(data, c);
     Links L;
-    build_links(c, L, (c.ev_bytes / 50 + c.ck_bytes / 35) / 8);
+    build_links(c, L);
     phase("links");
     EvParts sp;
     CkParts ckp;
     parse_and_dedup(c, L, sp, ckp);
     Agg A;
     sessions(c, sp, ckp, A);
+    resolve_names(T, L, sp, A);
     phase("sessions");
     write_outputs(c, L, A, outdir);
     phase("write");

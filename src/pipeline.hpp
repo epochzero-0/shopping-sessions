@@ -171,49 +171,53 @@ struct Ctx {
 };
 
 // ---- links.cpp
-// User keys: pack_id(ID) when the ID is in that form, else FBIT | its number in FTab, where an ID is identified by 96
-// bits of hash (hash_bytes, hash2) as event IDs are, so a lookup never reads the stored bytes. FTab is a lazily
-// touched reservation.
-struct FTab {
+// Key kinds (packed keys are < 2^60, so FBIT is free):
+//   pack_id(ID)                    an ID in that form, exact
+//   FBIT | HBIT | hash_bytes >> 2  any other user ID, identified by 62 bits of hash; no table
+//   FBIT | node id                 a linked person named by an ID that does not pack; Links keeps its bytes
+static const uint64_t HBIT = 1ull << 62;
+static inline uint64_t user_key(const char* p, uint32_t n) {
+    const uint64_t k = pack_id(p, n);
+    return k ? k : FBIT | HBIT | hash_bytes(p, n) >> 2;
+}
+static inline bool hashed_key(uint64_t k) { return (k & (FBIT | HBIT)) == (FBIT | HBIT); }
+
+// The bytes of a user ID that starts at p inside a parsed line: it ends at the next ',' or '"', which no value holds.
+static inline uint32_t id_len(const char* p) {
+    uint32_t n = 0;
+    while (p[n] != ',' && p[n] != '"' && p[n] != '\n') n++;
+    return n;
+}
+
+// Names of persons keyed by a hashed user key: filled from the parse's (key, ID pointer) records after sessions.
+struct HNames {
     struct Slot {
-        std::atomic<uint64_t> h;
-        std::atomic<uint32_t> id1;  // id + 1, 0 while the inserting thread is still writing
-        std::atomic<uint32_t> h2;   // written before id1
+        uint64_t key;
+        std::atomic<const char*> p;
     };
-    Slot* s = nullptr;
+    vector<Slot> s;
     size_t mask = 0;
-    const char** name_p = nullptr;
-    uint32_t* name_l = nullptr;
-    std::atomic<uint32_t> next{0};
-    uint32_t cap = 0;
-    void init(size_t n);
-    ~FTab();
-    uint32_t get(const char* p, uint32_t n) {
-        uint64_t h = hash_bytes(p, n);
-        if (!h) h = 1;
-        const uint32_t h2 = hash2(p, n);
-        for (size_t i = h & mask;; i = (i + 1) & mask) {
-            uint64_t cur = s[i].h.load(std::memory_order_relaxed);
-            if (cur == 0 && s[i].h.compare_exchange_strong(cur, h, std::memory_order_relaxed)) {
-                uint32_t id = next.fetch_add(1, std::memory_order_relaxed);
-                if (id >= cap) { fprintf(stderr, "fallback table full\n"); abort(); }
-                name_p[id] = p;
-                name_l[id] = n;
-                s[i].h2.store(h2, std::memory_order_relaxed);
-                s[i].id1.store(id + 1, std::memory_order_release);
-                return id;
-            }
-            if (cur == h) {
-                uint32_t id1;
-                while (!(id1 = s[i].id1.load(std::memory_order_acquire))) {
-                }
-                if (s[i].h2.load(std::memory_order_relaxed) == h2) return id1 - 1;
+    void init(size_t n) {
+        size_t c = 16;
+        while (c < n * 2) c <<= 1;
+        s = vector<Slot>(c);
+        mask = c - 1;
+    }
+    size_t at(uint64_t k) const { return (size_t)((k * 0x9FB21C651E98DF25ull) >> 20) & mask; }
+    void add(uint64_t k) {
+        for (size_t i = at(k);; i = (i + 1) & mask) {
+            if (s[i].key == k) return;
+            if (!s[i].key) {
+                s[i].key = k;
+                return;
             }
         }
     }
-    uint64_t key(const char* p, uint32_t n) {
-        uint64_t k = pack_id(p, n);
-        return k ? k : FBIT | get(p, n);
+    Slot* find(uint64_t k) {
+        for (size_t i = at(k);; i = (i + 1) & mask) {
+            if (s[i].key == k) return &s[i];
+            if (!s[i].key) return nullptr;
+        }
     }
 };
 
@@ -227,7 +231,10 @@ struct Links {
     Slot* s = nullptr;
     size_t mask = 0;
     int shift = 64;
-    FTab F;
+    const char** np = nullptr;  // node id -> ID bytes
+    uint32_t* nl = nullptr;
+    size_t ncap = 0;
+    HNames H;
     void init(size_t n);
     ~Links();
     size_t idx(uint64_t k) const { return (size_t)((k * 0xD6E8FEB86659FD93ull) >> shift); }
@@ -239,19 +246,23 @@ struct Links {
             if (!x) return k;
         }
     }
-    // the person's name: unpacked into buf, or the fallback table's bytes
-    const char* name(uint64_t k, char* buf, uint32_t& n) const {
+    // the person's name: unpacked into buf, a link node's bytes, or a hashed key's ID in the input
+    const char* name(uint64_t k, char* buf, uint32_t& n) {
+        if (hashed_key(k)) {
+            const char* p = H.find(k)->p.load(std::memory_order_relaxed);
+            n = id_len(p);
+            return p;
+        }
         if (k & FBIT) {
-            n = F.name_l[(uint32_t)k];
-            return F.name_p[(uint32_t)k];
+            n = nl[(uint32_t)k];
+            return np[(uint32_t)k];
         }
         n = unpack_id(k, buf);
         return buf;
     }
 };
 static inline uint32_t kpart(uint64_t k) { return (uint32_t)((k * 0x9E3779B97F4A7C15ull) >> (64 - PBITS)); }
-// est_users: an upper bound on distinct user IDs outside links
-void build_links(const Ctx& c, Links& L, size_t est_users);
+void build_links(const Ctx& c, Links& L);
 
 // ---- events.cpp
 struct SessEv {
@@ -270,11 +281,19 @@ struct ClickRec {
 };
 static const uint32_t PRICE_MASK = 0xFFFFFF;
 
+// A valid event's hashed user key and where its ID starts in the input
+struct NameRec {
+    uint64_t key;
+    const char* p;
+};
+
 // [thread][person partition], blocks in `arena`
 struct EvParts {
     Arena arena;
     Arena evarena;  // the dedup stage's EvRec blocks; dead ones hold SessEv blocks, so it lives as long as p
     vector<vector<BList<SessEv>>> p;
+    Arena narena;
+    vector<BList<NameRec>> names;  // [thread]
 };
 struct CkParts {
     Arena arena;

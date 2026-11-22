@@ -55,7 +55,7 @@ static inline uint32_t unpack_id(uint64_t k, char* out) {
     return n;
 }
 
-// Keys with this bit are not packed IDs: fallback tables number them.
+// Keys with this bit are not packed IDs.
 static const uint64_t FBIT = 1ull << 63;
 
 static inline uint64_t mix(uint64_t a, uint64_t b) {

@@ -10,7 +10,7 @@ mkdir -p build; O=build/ab.txt; : > "$O"
 i=0
 while [ $i -lt "$N" ]; do
   for img in "$A" "$B"; do
-    r=$(IMAGE=$img BENCH=3 sh scripts/docker_run_win.sh "vol:${VOL:-infv2}" out_big 2>&1)
+    r=$(IMAGE=$img BENCH=3 sh scripts/docker_run_win.sh "vol:${VOL:-infv3}" out_big 2>&1)
     echo "$img $(echo "$r" | grep '^run 1:') | $(echo "$r" | grep '^BENCH')" >> "$O"
   done
   i=$((i + 1))

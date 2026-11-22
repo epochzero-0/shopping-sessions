@@ -13,7 +13,7 @@ struct EvRec {
     uint32_t ingest;  // seconds since epoch
     uint32_t ts;      // ms since window_start; INVALID = dropped by validation
     uint32_t pc;      // price | cat << 24
-    uint64_t uk;      // user key (FTab::key); the person is resolved after dedup
+    uint64_t uk;      // user_key(user_id); the person is resolved after dedup
 };
 static_assert(sizeof(EvRec) == 32, "EvRec");
 static const uint32_t INVALID = UINT32_MAX;  // the window is < 2^32 ms - 7 days
@@ -31,6 +31,8 @@ void parse_and_dedup(const Ctx& c, Links& L, EvParts& sp, CkParts& ckp) {
     Arena& eva = sp.evarena;
     eva.init(c.ev_bytes / 16 * sizeof(EvRec) + slack);
     ckp.arena.init(c.ck_bytes / 12 * sizeof(ClickRec) + slack);
+    sp.narena.init(c.ev_bytes / 16 * sizeof(NameRec) + (size_t)T * (1 << 16));
+    sp.names.assign(T, {});
     vector<vector<BList<EvRec>>> evp(T, vector<BList<EvRec>>(NPART));
     ckp.p.assign(T, vector<BList<ClickRec>>(NPART));
     {
@@ -38,6 +40,7 @@ void parse_and_dedup(const Ctx& c, Links& L, EvParts& sp, CkParts& ckp) {
         parallel(T, [&](int t) {
             WCLists<EvRec> ev(evp[t], eva);
             WCLists<ClickRec> ck(ckp.p[t], ckp.arena);
+            BList<NameRec>& names = sp.names[t];
             // clicks wait RING lines between the link-slot prefetch and the probe; key holds the user key meanwhile
             const uint32_t RING = 8;
             ClickRec ring[RING];
@@ -99,7 +102,8 @@ void parse_and_dedup(const Ctx& c, Links& L, EvParts& sp, CkParts& ckp) {
                             if (cat < 0) cat = c.unknown_cat;
                             r.pc = (uint32_t)price | (uint32_t)cat << 24;
                             r.ts = (uint32_t)(ts - ws);
-                            r.uk = L.F.key(fp[1], fl[1]);
+                            r.uk = user_key(fp[1], fl[1]);
+                            if (__builtin_expect(hashed_key(r.uk), 0)) names.push(sp.narena, {r.uk, fp[1]});
                         }
                         ev.push(kpart(r.ek), r);
                     });
@@ -114,7 +118,7 @@ void parse_and_dedup(const Ctx& c, Links& L, EvParts& sp, CkParts& ckp) {
                         ClickRec& r = ring[rn % RING];
                         if (rn >= RING) click_out(r);
                         rn++;
-                        r.key = L.F.key(fp[1], fl[1]);
+                        r.key = user_key(fp[1], fl[1]);
                         __builtin_prefetch(L.at(r.key));
                         r.ts = (uint32_t)(ts - (ws - WEEK_MS));
                         r.cid = fp[0];
